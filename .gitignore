@@ -1,0 +1,27 @@
+# Logs
+logs/
+
+# Environment
+.env
+.venv/
+.env.production
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+venv/
+.postman/
+Md\ files/
+pytest.ini
+requirements-test.txt
+tests/test_auth_and_sessions.py

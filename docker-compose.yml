@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  mindbridge-api:
+    build: .
+    container_name: mindbridge-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # MONGODB_URL must be set in your .env file — no default is provided here.
+      # Running without .env will cause a startup failure (intentional — prevents
+      # accidental connection to production Atlas with a leaked default credential).
+      - MONGODB_URL=${MONGODB_URL:?MONGODB_URL must be set in .env}
+      - DATABASE_NAME=${DATABASE_NAME:-mindbridge_db}
+    volumes:
+      # Persists logs to the server
+      - ./logs:/app/logs
