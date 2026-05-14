@@ -31,9 +31,10 @@ from bson import ObjectId
 
 from app.core.database import get_database
 from app.core.connection_registry import is_counselor_connected
+from app.core.logger import get_logger
 from app.services.summarization_service import generate_clinical_handoff
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _STALE_PING_SECONDS = 2100  # 35 minutes — counselor stays visible while idle
 _STALE_LOCK_MINUTES = 5

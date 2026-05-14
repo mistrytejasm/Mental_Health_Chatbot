@@ -1,13 +1,14 @@
 import asyncio
-import logging
-from typing import List, Dict, Optional
-from datetime import datetime, timezone
-from openai import AsyncOpenAI
-from app.core.database import get_database
-from app.core.config import get_settings
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+from openai import AsyncOpenAI
+
+from app.core.config import get_settings
+from app.core.database import get_database
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
 settings = get_settings()
 
 

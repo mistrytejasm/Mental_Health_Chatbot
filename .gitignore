@@ -25,3 +25,6 @@ Md\ files/
 pytest.ini
 requirements-test.txt
 tests/test_auth_and_sessions.py
+reference/
+rhs-web-dev/
+useHelproomWebSocket.tsx

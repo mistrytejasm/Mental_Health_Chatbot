@@ -51,7 +51,7 @@ from app.core.logger import get_logger
 from app.core.config import get_settings
 from app.core.auth.hashing import Hash
 from app.core.auth.password_policy import validate_password
-from app.core.auth.JWTtoken import (
+from app.core.auth.jwt_handler import (
     create_access_token,
     create_refresh_token,
     verify_refresh_token,
