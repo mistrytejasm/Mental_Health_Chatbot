@@ -1,3 +1,10 @@
+import bcrypt
+# Fix passlib incompatibility with bcrypt 4.0+
+if not hasattr(bcrypt, "__about__"):
+    class BcryptAbout:
+        __version__ = getattr(bcrypt, "__version__", "4.0.0")
+    bcrypt.__about__ = BcryptAbout()
+
 from passlib.context import CryptContext
 
 pwd_cxt = CryptContext(schemes=["bcrypt"], deprecated="auto")

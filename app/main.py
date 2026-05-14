@@ -1,4 +1,11 @@
 import asyncio
+import bcrypt
+
+# Fix passlib incompatibility with bcrypt 4.0+
+if not hasattr(bcrypt, "__about__"):
+    class BcryptAbout:
+        __version__ = getattr(bcrypt, "__version__", "4.0.0")
+    bcrypt.__about__ = BcryptAbout()
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -70,7 +77,7 @@ _allowed_origins = (
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_allowed_origins,
+    allow_origin_regex=r"https?://.*",  # Permissive for development/local WiFi
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     # ── CORS ─────────────────────────────────────────────────────────────────
     # Comma-separated list of allowed origins. Leave empty to allow all (dev only).
     ALLOWED_ORIGINS: str = ""
+    ALLOWED_ORIGINS: str = "http://192.168.29.22:5173"
 
     # ── JWT Authentication ────────────────────────────────────────────────────
     SECRET_KEY: str = Field(
