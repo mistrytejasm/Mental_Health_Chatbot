@@ -14,6 +14,7 @@ Contains all long-running async background functions used by the human handoff s
 """
 
 import asyncio
+import random
 from datetime import datetime, timezone
 from typing import Optional
 from fastapi import WebSocket
@@ -32,8 +33,8 @@ logger = get_logger(__name__)
 # ── Timing constants ──────────────────────────────────────────────────────────
 
 COUNSELOR_JOIN_TIMEOUT_SECONDS = 1200  # 20 min: max wait for counselor to join after user connects
-USER_INACTIVITY_TIMEOUT_SECONDS = 600   # 10 min: max user silence before auto-close
-GLOBAL_INACTIVITY_TIMEOUT_MINUTES = 35  # 35 min: max session inactivity before watchdog closes it
+USER_INACTIVITY_TIMEOUT_SECONDS = 1800  # 30 min: max user silence before auto-close
+GLOBAL_INACTIVITY_TIMEOUT_MINUTES = 60  # 60 min: max session inactivity before watchdog closes it
 HEARTBEAT_INTERVAL_SECONDS = 20         # How often to refresh counselor last_ping in DB
 RECONNECT_GRACE_PERIOD_SECONDS = 120    # 2 min window for counselor to reconnect after a drop
 
@@ -141,7 +142,9 @@ async def inactivity_watchdog() -> None:
 
     while True:
         try:
-            await asyncio.sleep(60)
+            # LOW-3: Random jitter prevents all server instances waking at the same
+            # second and hammering MongoDB simultaneously (thundering herd).
+            await asyncio.sleep(60 + random.uniform(0, 10))
             expired_sessions = await get_expired_escalated_sessions(
                 timeout_minutes=GLOBAL_INACTIVITY_TIMEOUT_MINUTES
             )
@@ -269,15 +272,18 @@ async def _notify_assigned_counselor_user_waiting(
             logger.warning(
                 f"[NOTIFY] Patient-waiting push failed — counselor dashboard WS not found"
                 f" | session={session_id} | counselor_id={assigned_counselor_id}"
-                f" | waiting 30s for counselor to connect via chat URL"
             )
-            await asyncio.sleep(30)
+        
+        # H-5: Always wait for the counselor to actually join the room.
+        # Previously, if 'delivered' was True, it would exit immediately!
+        logger.info(f"[NOTIFY] Waiting 120s for counselor {assigned_counselor_id} to join session {session_id}")
+        await asyncio.sleep(120)
 
-            if await manager.is_role_in_room(session_id, "human_counselor"):
-                logger.info(
-                    f"[NOTIFY] Counselor joined chat room within 30s grace window | session={session_id}"
-                )
-                return
+        if await manager.is_role_in_room(session_id, "human_counselor"):
+            logger.info(
+                f"[NOTIFY] Counselor joined chat room within grace window | session={session_id}"
+            )
+            return
 
             db = get_database()
             if db is not None:
@@ -294,9 +300,20 @@ async def _notify_assigned_counselor_user_waiting(
                     return
 
             logger.warning(
-                f"[NOTIFY] Counselor did not connect within 30s — triggering re-route"
+                f"[NOTIFY] Counselor did not connect within 120s — triggering re-route"
                 f" | session={session_id} | excluded_counselor={assigned_counselor_id}"
             )
+            
+            # Notify user that we are still looking for a counselor
+            await manager.send_to_all(session_id, {
+                "role": "system",
+                "text": "The assigned counselor is unavailable. We are connecting you to another counselor now. Please stay with us.",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "is_human": False,
+                "is_system": True,
+                "type": "counselor_rerouting",
+            })
+
             from app.services.routing_service import route_crisis_session
             db = get_database()
             if db is not None:

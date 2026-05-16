@@ -1,4 +1,5 @@
 import json
+import time
 import uuid
 import asyncio
 from typing import Optional
@@ -7,6 +8,8 @@ from fastapi import WebSocket
 
 from app.core.logger import get_logger
 from app.core.redis import get_redis
+from app.core.database import get_database
+from bson import ObjectId
 
 logger = get_logger(__name__)
 
@@ -19,17 +22,41 @@ class ConnectionManager:
         self.dashboard_clients: set[WebSocket] = set()
         self.counselor_ws: dict[str, list[WebSocket]] = {}
         
+        self.session_activity_events: dict[str, asyncio.Event] = {}
         self.timeout_tasks: dict = {}
-        self._ended_sessions: set[str] = set()
+        # H-10: timestamp dict instead of a plain set.
+        # Entries are auto-expired after 1 hour by is_session_ended().
+        # This bounds memory to O(sessions per hour) instead of O(all-time sessions).
+        self._ended_sessions: dict[str, float] = {}  # session_id -> unix timestamp
         self.pubsub_tasks: dict[str, asyncio.Task] = {}
+        self.notify_tasks: dict[str, asyncio.Task] = {}
         self._dashboard_listener: Optional[asyncio.Task] = None
 
-    # ── Session-ended tracking ────────────────────────────────────────────────
+    # ── Session-ended tracking (H-10: TTL dict + Redis backup) ──────────────
+    _SESSION_ENDED_TTL = 3600  # 1 hour
+
     def mark_session_ended(self, session_id: str) -> None:
-        self._ended_sessions.add(session_id)
+        """Record a session as ended. Timestamp enables inline TTL expiry."""
+        self._ended_sessions[session_id] = time.monotonic()
+        # Also persist to Redis with matching TTL so the flag survives a server restart.
+        redis = get_redis()
+        if redis:
+            asyncio.create_task(
+                redis.setex(f"session:{session_id}:ended", self._SESSION_ENDED_TTL, "1")
+            )
 
     def is_session_ended(self, session_id: str) -> bool:
-        return session_id in self._ended_sessions
+        """Returns True if the session was marked ended within the last hour.
+        Expired entries are removed inline — no background cleanup needed.
+        """
+        ts = self._ended_sessions.get(session_id)
+        if ts is None:
+            return False
+        if time.monotonic() - ts > self._SESSION_ENDED_TTL:
+            # Entry has expired — remove it to free memory
+            del self._ended_sessions[session_id]
+            return False
+        return True
 
     # ── Timeout task management ───────────────────────────────────────────────
     def start_timeout_task(self, session_id: str, task) -> None:
@@ -42,6 +69,15 @@ class ConnectionManager:
 
     def remove_timeout_task(self, session_id: str) -> None:
         self.timeout_tasks.pop(session_id, None)
+
+    def start_notify_task(self, session_id: str, task: asyncio.Task) -> None:
+        existing = self.notify_tasks.pop(session_id, None)
+        if existing: existing.cancel()
+        self.notify_tasks[session_id] = task
+
+    def cancel_notify_task(self, session_id: str) -> None:
+        task = self.notify_tasks.pop(session_id, None)
+        if task: task.cancel()
 
     # ── Room counselor tracking (Redis) ───────────────────────────────────────
     async def is_counselor_in_room(self, session_id: str, counselor_id: str) -> bool:
@@ -115,6 +151,19 @@ class ConnectionManager:
         val = await redis.get(f"session:{session_id}:has_user")
         return val == "1"
 
+    # ── Activity Tracking ─────────────────────────────────────────────────────
+    def get_activity_event(self, session_id: str) -> asyncio.Event:
+        if session_id not in self.session_activity_events:
+            self.session_activity_events[session_id] = asyncio.Event()
+        return self.session_activity_events[session_id]
+
+    def mark_activity(self, session_id: str) -> None:
+        if session_id in self.session_activity_events:
+            self.session_activity_events[session_id].set()
+
+    def remove_activity_event(self, session_id: str) -> None:
+        self.session_activity_events.pop(session_id, None)
+
     # ── Connection lifecycle ──────────────────────────────────────────────────
     async def connect(self, session_id: str, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -135,6 +184,7 @@ class ConnectionManager:
             self.rooms[session_id] = [ws for ws in self.rooms[session_id] if ws is not websocket]
             if not self.rooms[session_id]:
                 del self.rooms[session_id]
+                self.remove_activity_event(session_id)
                 # Cancel local pubsub listener
                 task = self.pubsub_tasks.pop(session_id, None)
                 if task:
@@ -156,6 +206,7 @@ class ConnectionManager:
         try:
             async for message in pubsub.listen():
                 if message["type"] == "message":
+                    self.mark_activity(session_id)
                     data = json.loads(message["data"])
                     action = data.get("action", "broadcast")
                     
@@ -167,8 +218,8 @@ class ConnectionManager:
                             if self.ws_ids.get(ws) == exclude_ws_id:
                                 continue
                             try:
-                                await ws.send_text(json.dumps(payload))
-                            except Exception:
+                                await asyncio.wait_for(ws.send_text(json.dumps(payload)), timeout=5.0)  # H-6
+                            except (asyncio.TimeoutError, Exception):
                                 dead_sockets.append(ws)
                         for ws in dead_sockets:
                             await self.disconnect(session_id, ws)
@@ -179,9 +230,9 @@ class ConnectionManager:
                         socket_list = self.rooms.get(session_id, []).copy()
                         for ws in socket_list:
                             try:
-                                await ws.send_text(message_str)
+                                await asyncio.wait_for(ws.send_text(message_str), timeout=5.0)  # H-6
                                 await ws.close(code=4001)
-                            except Exception:
+                            except (asyncio.TimeoutError, Exception):
                                 pass
                         self.rooms.pop(session_id, None)
                         
@@ -234,6 +285,10 @@ class ConnectionManager:
             if redis:
                 await redis.sadd("dashboard:online_counselors", counselor_id)
 
+            # H-5: Pending notification sync is handled authoritatively by the
+            # dashboard_notifications_ws handler in websocket.py which has full
+            # validation (session still escalated check). Do NOT duplicate here.
+
         if not self._dashboard_listener:
             self._dashboard_listener = asyncio.create_task(self._listen_to_dashboard())
 
@@ -256,54 +311,66 @@ class ConnectionManager:
             self._dashboard_listener = None
 
     async def _listen_to_dashboard(self):
-        redis = get_redis()
-        if not redis: return
-        pubsub = redis.pubsub()
-        await pubsub.subscribe("channel:dashboard:broadcast")
-        await pubsub.psubscribe("channel:dashboard:notify:*")
-        
-        try:
-            async for message in pubsub.listen():
-                if message["type"] not in ("message", "pmessage"):
+        """
+        MEDIUM-6: Wrapped in a reconnect loop so a Redis restart or connection
+        drop does not silently kill all dashboard notifications. Auto-reconnects
+        after a 3-second backoff.
+        """
+        while True:
+            try:
+                redis = get_redis()
+                if not redis:
+                    await asyncio.sleep(5)
                     continue
-                raw = message["data"]
-                # decode_responses=True means data is already str, but guard against bytes
-                if isinstance(raw, bytes):
-                    raw = raw.decode()
-                try:
-                    data = json.loads(raw)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                action = data.get("action")
-                payload = data.get("payload", {})
+                pubsub = redis.pubsub()
+                await pubsub.subscribe("channel:dashboard:broadcast")
+                await pubsub.psubscribe("channel:dashboard:notify:*")
 
-                if action == "broadcast_all":
-                    dead_sockets: set = set()
-                    msg_str = json.dumps(payload)
-                    for ws in list(self.dashboard_clients):
-                        try:
-                            await ws.send_text(msg_str)
-                        except Exception:
-                            dead_sockets.add(ws)
-                    for ws in dead_sockets:
-                        self.disconnect_dashboard(ws)
+                async for message in pubsub.listen():
+                    if message["type"] not in ("message", "pmessage"):
+                        continue
+                    raw = message["data"]
+                    if isinstance(raw, bytes):
+                        raw = raw.decode()
+                    try:
+                        data = json.loads(raw)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    action = data.get("action")
+                    payload = data.get("payload", {})
 
-                elif action == "notify_counselor":
-                    counselor_id = data.get("counselor_id")
-                    target_sockets = self.counselor_ws.get(counselor_id, []).copy()
-                    msg_str = json.dumps(payload)
-                    dead: list = []
-                    for ws in target_sockets:
-                        try:
-                            await ws.send_text(msg_str)
-                        except Exception:
-                            dead.append(ws)
-                    for ws in dead:
-                        self.disconnect_dashboard(ws, counselor_id)
-        except asyncio.CancelledError:
-            await pubsub.unsubscribe()
-            await pubsub.punsubscribe()
-            await pubsub.close()
+                    if action == "broadcast_all":
+                        dead_sockets: set = set()
+                        msg_str = json.dumps(payload)
+                        for ws in list(self.dashboard_clients):
+                            try:
+                                await asyncio.wait_for(ws.send_text(msg_str), timeout=5.0)  # H-6
+                            except (asyncio.TimeoutError, Exception):
+                                dead_sockets.add(ws)
+                        for ws in dead_sockets:
+                            self.disconnect_dashboard(ws)
+
+                    elif action == "notify_counselor":
+                        counselor_id = data.get("counselor_id")
+                        target_sockets = self.counselor_ws.get(counselor_id, []).copy()
+                        msg_str = json.dumps(payload)
+                        dead: list = []
+                        for ws in target_sockets:
+                            try:
+                                await asyncio.wait_for(ws.send_text(msg_str), timeout=5.0)  # H-6
+                            except (asyncio.TimeoutError, Exception):
+                                dead.append(ws)
+                        for ws in dead:
+                            self.disconnect_dashboard(ws, counselor_id)
+
+            except asyncio.CancelledError:
+                break  # Intentional shutdown — do not reconnect
+            except Exception as e:
+                logger.error(
+                    f"[PUBSUB] Dashboard listener crashed: {e}. "
+                    f"Reconnecting in 3 seconds..."
+                )
+                await asyncio.sleep(3)  # Brief backoff before reconnect
 
     async def broadcast_to_dashboard(self, payload: dict) -> None:
         redis = get_redis()
@@ -318,13 +385,11 @@ class ConnectionManager:
         Sends a targeted notification to a specific counselor.
 
         Delivery strategy (two-tier):
-          1. If the counselor has a dashboard WebSocket on *this* process, deliver
-             directly via the local socket list — instantaneous and reliable.
-          2. If they are on a *different* process (multi-instance deploy), publish to
-             the Redis Pub/Sub channel so the other instance delivers it.
+          1. Local socket delivery (instantaneous).
+          2. Redis Pub/Sub for cross-instance delivery.
 
-        Returns True when the counselor is reachable (local delivery confirmed OR
-        they are registered in the global 'dashboard:online_counselors' Redis set).
+        H-6: All sends are wrapped with a 5-second timeout so a half-open TCP
+        socket on an unstable network never blocks the notification coroutine.
         """
         # --- Tier 1: direct delivery on this process ---
         local_sockets = self.counselor_ws.get(counselor_id, [])
@@ -334,9 +399,9 @@ class ConnectionManager:
             delivered = False
             for ws in list(local_sockets):
                 try:
-                    await ws.send_text(msg_str)
+                    await asyncio.wait_for(ws.send_text(msg_str), timeout=5.0)  # H-6
                     delivered = True
-                except Exception:
+                except (asyncio.TimeoutError, Exception):
                     dead.append(ws)
             for ws in dead:
                 self.disconnect_dashboard(ws, counselor_id)

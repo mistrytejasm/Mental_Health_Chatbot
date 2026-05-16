@@ -124,7 +124,8 @@ async def synthesize_consensus(text: str, roberta_emotion: str, roberta_score: f
         "2. NEGATION DETECTION: Set is_crisis=false if the user is expressing a desire to live or denying intent (e.g., 'I don't want to die', 'I'm not suicidal', 'I want to stay alive').\n"
         "3. IDIOM DETECTION: Distinguish between metaphors ('this is killing me', 'I feel dead inside') and literal intent.\n"
         "4. FEAR vs INTENT: 'I'm scared of dying' is NOT a crisis. 'I want to die' IS a crisis.\n"
-        "5. INTENT/PLAN: Any expression of current intent, plan, or desire to end one's life or self-harm must be is_crisis=true.\n\n"
+        "5. INTENT/PLAN: Any expression of current intent, plan, or desire to end one's life or self-harm must be is_crisis=true.\n"
+        "6. GREETINGS: Do NOT set is_crisis=true for isolated greetings (e.g., 'hi', 'hello', 'hey', 'good morning') even if the history contains a past crisis. Only escalate if the current message continues the crisis or expresses new distress.\n\n"
 
         "CRITICAL RULES FOR WANTS_COUNSELOR:\n"
         "1. CURRENT MESSAGE ONLY: Evaluate ONLY the 'Current User Text' to determine if they want a counselor. Do NOT set wants_counselor=true if they only asked in the Conversation History but not in the current message.\n"

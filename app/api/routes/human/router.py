@@ -82,44 +82,43 @@ async def list_escalated_sessions(
             {"$set": {"is_online": True, "checked_in_at": now_utc, "last_ping": now_utc}},
         )
         counselor_doc = await db.admins.find_one({"_id": ObjectId(doctor_id)})
+    
+    # Fix: Fetch the full document with notifications if it was re-queried or is missing fields
+    pending_notifications = (counselor_doc or {}).get("pending_notifications", [])
 
     # Mark counselor as connected in memory so REST-polling counselors bypass WS checks
     from app.core.connection_registry import force_counselor_connected
     force_counselor_connected(doctor_id)
     update_fields: dict = {"last_ping": now_utc}
 
-    # Deliver any pending_notification queued while counselor was offline
-    pending_notif = (counselor_doc or {}).get("pending_notification")
-    if pending_notif:
-        notif_session_id = pending_notif.get("session_id")
-        should_deliver = True
-        if notif_session_id:
+    # Deliver any pending_notifications queued while counselor was offline
+    if pending_notifications:
+        delivered_any = False
+        for notif in pending_notifications:
             try:
-                notif_session_doc = await db.sessions.find_one({"session_id": notif_session_id})
-                if notif_session_doc and not notif_session_doc.get("is_escalated", False):
-                    should_deliver = False  # Session already closed — discard stale notification
+                notif_session_id = notif.get("session_id")
+                should_deliver = True
+                if notif_session_id:
+                    notif_session_doc = await db.sessions.find_one({"session_id": notif_session_id})
+                    if notif_session_doc and not notif_session_doc.get("is_escalated", False):
+                        should_deliver = False
+                
+                if should_deliver:
+                    # Attempt a real-time push to their open WebSocket
+                    await manager.notify_counselor(doctor_id, notif)
+                    delivered_any = True
             except Exception:
                 pass
-        if should_deliver:
-            delivered = await manager.notify_counselor(doctor_id, pending_notif)
-            if delivered:
-                logger.info(
-                    f"[NOTIFY] Deferred pending_notification delivered via WS"
-                    f" | counselor_id={doctor_id} | session={notif_session_id}"
-                )
-            else:
-                logger.info(
-                    f"[NOTIFY] pending_notification will surface via session list (Case B)"
-                    f" | counselor_id={doctor_id} | session={notif_session_id}"
-                )
-        update_fields["pending_notification"] = None
+        
+        # Clear queue in DB after delivery attempt
+        # Fix: DO NOT clear the queue here. Clearing the queue in the REST list view 
+        # causes notifications to 'disappear' if the counselor refreshes their dashboard.
+        # The Dashboard WebSocket (websocket.py) is the authoritative deliverer.
+        pass
 
     await db.admins.update_one(
         {"_id": ObjectId(doctor_id)},
-        {
-            "$set": {k: v for k, v in update_fields.items() if k != "pending_notification"},
-            **({"$unset": {"pending_notification": ""}} if pending_notif else {}),
-        },
+        {"$set": update_fields},
     )
 
     counselor_is_free = (counselor_doc or {}).get("current_active_sessions", 0) == 0

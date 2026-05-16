@@ -148,8 +148,12 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
     recent_history_str = session_service.build_recent_history_string(history, n_turns=4)
 
     logger.info("\n" + "═" * 70)
-    logger.info(f"[STREAM] User: {user_id} | Session: {actual_session_id} | Turn: {turn_count}")
-    logger.info(f"[USER]:  {req.message}")
+    logger.info(
+        f"[STREAM] User: {user_id} | Session: {actual_session_id} | Turn: {turn_count}"
+        f" | MsgLen: {len(req.message)}"
+    )
+    # LOW-2: Message content is PII — only logged at DEBUG to protect user privacy.
+    logger.debug(f"[USER MESSAGE]: {req.message}")
     logger.info("═" * 70)
 
     # 3. Generate embedding and retrieve long-term memory (RAG)
