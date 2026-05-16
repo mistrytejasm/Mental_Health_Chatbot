@@ -45,34 +45,7 @@ router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
-
-def _build_recent_history_string(history: list[dict], n_turns: int = 4) -> str:
-    if not history:
-        return ""
-    recent = history[-(n_turns * 2):]
-    lines = []
-    for msg in recent:
-        role = "User" if msg.get("role") == "user" else "MindBridge"
-        content = msg.get("content", "").strip()
-        if content:
-            lines.append(f"{role}: {content}")
-    return "\n".join(lines)
-
-
-def _safe_fallback_consensus() -> dict:
-    return {
-        "llm_sentiment":    "neutral",
-        "category":         "general",
-        "intensity":        "moderate",
-        "is_crisis":        False,
-        "wants_counselor":  False,
-        "crisis_type":      None,
-        "reasoning":        "fallback",
-        "recommended_tone": "validating",
-        "message_class":    "emotional_ongoing",
-        "token_budget":     320,
-    }
+from app.services.session_service import session_service
 
 
 # ── Counselor Status API ────────────────────────────────────────────────────────
@@ -103,59 +76,8 @@ async def manual_escalate(
     """
     user_id = str(current_user.get("user_id") or current_user.get("_id"))
     
-    # 1. Fetch the user's active session instead of requiring it from the body
-    session_data = await get_existing_session(user_id)
-    if not session_data:
-        return {"status": "failed", "message": "No active chat session found to escalate."}
-        
-    actual_session_id = session_data["session_id"]
-
-    # 2. Check if any counselors are actually online before escalating
-    from app.services.routing_service import get_available_counselor_count
-    count = await get_available_counselor_count()
-    if count == 0:
-        hotline_text = "No counselor is available at the moment. Please call the helpline at 911."
-        db = get_database()
-        if db is not None:
-            await db.messages.insert_one({
-                "session_id": actual_session_id,
-                "user_id": user_id,
-                "role": "system",
-                "sender_type": "system",
-                "content": hotline_text,
-                "timestamp": datetime.now(timezone.utc),
-            })
-        return {"status": "failed", "message": hotline_text}
-
-    # 3. Mark the session as escalated (is_escalated = True)
-    success = await escalate_session(actual_session_id)
-    if not success:
-        return {"status": "failed", "message": "Failed to escalate session"}
-
-    # 4. Create a pseudo-consensus to feed into the routing engine
-    consensus = {
-        "is_crisis": True,
-        "category": "manual_escalation",
-        "intensity": "high",
-        "reasoning": "User requested manual escalation via app button",
-    }
-
-    # 5. Trigger the smart routing engine in the background.
-    # The routing service exclusively owns all dashboard notifications:
-    # it sends a targeted push to the user's previous counselor (if online)
-    # or a broadcast to all counselors (if no preferred counselor / offline).
-    # Do NOT fire a pre-emptive broadcast here — it would notify every counselor
-    # before routing has determined who should actually receive the session.
-    from app.services.routing_service import route_crisis_session
-    asyncio.create_task(
-        route_crisis_session(
-            user_id=user_id,
-            session_id=actual_session_id,
-            consensus=consensus,
-        )
-    )
-
-    return {"status": "success"}
+    result = await session_service.process_manual_escalation(user_id)
+    return result
 
 
 # ── SSE Stream ─────────────────────────────────────────────────────────────────
@@ -223,7 +145,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
     # 2. Load full conversation history
     history = await get_formatted_history(actual_session_id, limit=100)
     turn_count = len(history) // 2
-    recent_history_str = _build_recent_history_string(history, n_turns=4)
+    recent_history_str = session_service.build_recent_history_string(history, n_turns=4)
 
     logger.info("\n" + "═" * 70)
     logger.info(f"[STREAM] User: {user_id} | Session: {actual_session_id} | Turn: {turn_count}")
@@ -281,7 +203,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
         )
     except Exception as e:
         logger.error(f"[STEP 2 ERROR] {e}")
-        consensus = _safe_fallback_consensus()
+        consensus = session_service.safe_fallback_consensus()
 
     # ── Nuance handling now managed by context-aware LLM in synthesize_consensus ──
     is_message_crisis = bool(consensus.get("is_crisis", False))

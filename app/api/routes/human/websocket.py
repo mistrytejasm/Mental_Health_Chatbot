@@ -31,6 +31,14 @@ from app.core.auth.jwt_handler import verify_token
 from app.core.connection_registry import mark_counselor_connected, mark_counselor_disconnected
 from app.core.database import get_database
 from app.core.logger import get_logger
+from app.models.events import (
+    OutgoingMessageEvent,
+    SystemNoticeEvent,
+    SessionEndedEvent,
+    SystemHandoffBriefEvent,
+    UserDisconnectedEvent,
+    SessionClaimedEvent,
+)
 from app.services.db_service import save_message
 
 from .background_tasks import (
@@ -195,8 +203,8 @@ async def dashboard_notifications_ws(websocket: WebSocket) -> None:
         manager.disconnect_dashboard(websocket, counselor_id=counselor_id)
         try:
             await websocket.close(code=1011)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[WS DASHBOARD] Failed to cleanly close socket | error={e}")
 
     finally:
         if heartbeat_task is not None:
@@ -317,13 +325,8 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
                 return
             manager.mark_session_ended(session_id)
             await websocket.accept()
-            await websocket.send_json({
-                "type": "session_ended",
-                "role": "system",
-                "text": "This session has already ended. You will be returned to AI support.",
-                "is_system": True,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
+            event = SessionEndedEvent(text="This session has already ended. You will be returned to AI support.")
+            await websocket.send_json(event.model_dump())
             await websocket.close(code=4001)
             logger.warning(
                 f"[WS CHAT] REJECTED | session={session_id} | role=user"
@@ -490,22 +493,21 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
         )
 
         # Notify all dashboards that this session has been claimed
-        asyncio.create_task(manager.broadcast_to_dashboard({
-            "type": "session_claimed",
-            "session_id": session_id,
-            "counselor_id": authenticated_user_id,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }))
+        claim_event = SessionClaimedEvent(
+            session_id=session_id,
+            counselor_id=authenticated_user_id
+        )
+        asyncio.create_task(manager.broadcast_to_dashboard(claim_event.model_dump()))
 
         # Send handoff brief immediately; start background task for the real GPT-4o summary
         if db is not None and session_doc is not None:
             handoff_summary = session_doc.get("handoff_summary")
-            await websocket.send_json({
-                "type": "system_handoff_brief",
-                "content": handoff_summary or "Clinical summary is being generated — you will receive it shortly.",
-                "crisis_category": session_doc.get("crisis_category", "unknown"),
-                "summary_ready": bool(handoff_summary),
-            })
+            handoff_event = SystemHandoffBriefEvent(
+                content=handoff_summary or "Clinical summary is being generated — you will receive it shortly.",
+                crisis_category=session_doc.get("crisis_category", "unknown"),
+                summary_ready=bool(handoff_summary),
+            )
+            await websocket.send_json(handoff_event.model_dump())
 
             if handoff_summary:
                 logger.info(
@@ -521,15 +523,14 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
                 asyncio.create_task(_deliver_handoff_when_ready(websocket, session_id, db))
 
         # Broadcast join notice to the patient
-        join_notice = {
-            "role": "human_counselor",
-            "counselor_name": counselor_display_name,
-            "text": f"{counselor_display_name} has joined the chat. You're not alone.",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "is_human": True,
-            "is_system": True,
-        }
-        await manager.broadcast(session_id, join_notice, websocket)
+        join_event = SystemNoticeEvent(
+            role="human_counselor",
+            counselor_name=counselor_display_name,
+            text=f"{counselor_display_name} has joined the chat. You're not alone.",
+            is_human=True,
+            is_system=True,
+        )
+        await manager.broadcast(session_id, join_event.model_dump(), websocket)
 
     # ── 10. Message loop ───────────────────────────────────────────────────────
     try:
@@ -575,15 +576,13 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
                 f' | preview="{preview}"'
             )
 
-            outbound_payload = {
-                "type": "message",
-                "role": role,
-                "counselor_name": counselor_display_name if is_counselor_message else None,
-                "text": message_text,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "is_human": is_counselor_message,
-                "done": True,
-            }
+            outbound_event = OutgoingMessageEvent(
+                role=role,
+                counselor_name=counselor_display_name if is_counselor_message else None,
+                text=message_text,
+                is_human=is_counselor_message,
+                done=True,
+            )
 
             await save_message({
                 "session_id": session_id,
@@ -593,7 +592,7 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
                 "is_human_message": is_counselor_message,
             })
 
-            await manager.broadcast(session_id, outbound_payload, sender_ws=None)
+            await manager.broadcast(session_id, outbound_event.model_dump(), sender_ws=None)
 
     except WebSocketDisconnect:
         manager.disconnect(session_id, websocket)
@@ -614,14 +613,8 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
                 f" | user={user_display_name} (id={authenticated_user_id})"
             )
             if manager.is_role_in_room(session_id, "human_counselor"):
-                await manager.broadcast(session_id, {
-                    "role": "system",
-                    "text": "The user has disconnected from the session.",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "is_human": False,
-                    "is_system": True,
-                    "type": "user_disconnected",
-                }, websocket)
+                disconnect_event = UserDisconnectedEvent()
+                await manager.broadcast(session_id, disconnect_event.model_dump(), websocket)
 
     except Exception as exc:
         logger.error(
@@ -632,8 +625,8 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
         manager.disconnect(session_id, websocket)
         try:
             await websocket.close(code=1011)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[WS CHAT] Failed to cleanly close socket | session={session_id} | error={e}")
 
     finally:
         if heartbeat_task is not None:

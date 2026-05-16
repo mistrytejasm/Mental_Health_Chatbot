@@ -217,8 +217,8 @@ class ConnectionManager:
             try:
                 await ws.send_text(message)
                 await ws.close(code=4001)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(f"[WS] Failed to send terminal message or close socket | session={session_id} | error={exc}")
 
         # Clean up room state directly without triggering timeout cancellation
         self.rooms.pop(session_id, None)
