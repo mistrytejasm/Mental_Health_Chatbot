@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # Gmail SMTP Configuration
 SENDER_EMAIL = os.getenv("SENDER_EMAIL", "")
 SENDER_PASSWORD = os.getenv("SENDER_PASSWORD", "")
-SENDER_NAME = "MindBridge"
+SENDER_NAME = "MindBuddy"
 
 
 def generate_otp() -> str:
@@ -117,7 +117,7 @@ async def send_otp_email(recipient: str, otp: str) -> bool:
             </p>
             
             <p style="color: #666; font-size: 16px; line-height: 1.6;">
-                You requested to reset your password for your MindBridge account. 
+                You requested to reset your password for your MindBuddy account. 
                 Please use the OTP below to proceed. This OTP is valid for {settings.OTP_EXPIRY_MINUTES} minutes.
             </p>
             
@@ -136,10 +136,10 @@ async def send_otp_email(recipient: str, otp: str) -> bool:
             
             <p style="color: #999; font-size: 12px;">
                 Regards,<br>
-                MindBridge Team
+                MindBuddy Team
             </p>
         </div>
     </div>
     """
     
-    return await send_email(recipient, "Password Reset OTP - MindBridge", html_body)
+    return await send_email(recipient, "Password Reset OTP - MindBuddy", html_body)

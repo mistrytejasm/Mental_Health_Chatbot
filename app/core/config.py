@@ -29,13 +29,14 @@ logger = get_logger(__name__)
 
 
 class Settings(BaseSettings):
-    APP_NAME:    str = "MindBridge"
+    APP_NAME:    str = "MindBuddy"
     APP_VERSION: str = "1.0.0"
     DEBUG:       bool = False
     
-    # ── Database ──────────────────────────────────────────────────────────────
+    # ── Database & Cache ──────────────────────────────────────────────────────
     MONGODB_URL: str = "mongodb://localhost:27017"
-    DATABASE_NAME: str = "mindbridge_db"
+    DATABASE_NAME: str = "mindbuddy_db"
+    REDIS_URL: str = "redis://localhost:6379/0"
 
     # ── OpenAI — Main Generator ───────────────────────────────────────────────
     OPENAI_API_KEY: str  = ""

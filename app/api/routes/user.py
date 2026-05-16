@@ -160,7 +160,7 @@ async def _generate_login_greeting(first_name: str, personality_summary: str) ->
     }
     prompt = (
         f"Write a single short sentence (max 15 words) welcoming {first_name} back "
-        "to MindBridge. Use their name. Sound warm and genuine, not generic. "
+        "to MindBuddy. Use their name. Sound warm and genuine, not generic. "
         "No sign-off, no questions, no emojis. Plain text only."
     )
     try:
@@ -171,7 +171,7 @@ async def _generate_login_greeting(first_name: str, personality_summary: str) ->
         resp = await client.chat.completions.create(
             model=_settings.MAIN_MODEL,
             messages=[
-                {"role": "system", "content": f"You are MindBridge, a warm mental health companion. Personality context for {first_name}: {personality_summary}"},
+                {"role": "system", "content": f"You are MindBuddy, a warm mental health companion. Personality context for {first_name}: {personality_summary}"},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=40,

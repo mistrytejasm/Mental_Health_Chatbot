@@ -353,7 +353,7 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
 
     # ── 7. Accept and register the connection ─────────────────────────────────
     await manager.connect(session_id, websocket)
-    manager.register_ws_role(websocket, role)
+    await manager.register_ws_role(websocket, session_id, role)
 
     # Resolve display names for structured logging
     user_display_name = user_id
@@ -385,7 +385,7 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
             f" | active_connections={len(manager.rooms.get(session_id, []))}"
         )
     else:
-        manager.mark_user_joined(session_id)
+        await manager.mark_user_joined(session_id)
         logger.info(
             f"[WS CHAT] CONNECTED | role=user"
             f" | session={session_id}"
@@ -422,7 +422,7 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
     # ── 9. Counselor: update presence and send handoff brief ──────────────────
     if role == "human_counselor":
         mark_counselor_connected(authenticated_user_id)
-        is_first_tab_for_session = manager.add_counselor_to_room(
+        is_first_tab_for_session = await manager.add_counselor_to_room(
             session_id, authenticated_user_id
         )
 
@@ -479,7 +479,7 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
                 )
 
         heartbeat_task = asyncio.create_task(_counselor_heartbeat(authenticated_user_id))
-        manager.mark_human_joined(session_id)
+        await manager.mark_human_joined(session_id)
         manager.cancel_timeout_task(session_id)
 
         # Log the clear user↔counselor mapping now that both sides are identified
@@ -595,7 +595,7 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
             await manager.broadcast(session_id, outbound_event.model_dump(), sender_ws=None)
 
     except WebSocketDisconnect:
-        manager.disconnect(session_id, websocket)
+        await manager.disconnect(session_id, websocket)
 
         if role == "human_counselor":
             logger.warning(
@@ -612,7 +612,7 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
                 f" | session={session_id}"
                 f" | user={user_display_name} (id={authenticated_user_id})"
             )
-            if manager.is_role_in_room(session_id, "human_counselor"):
+            if await manager.is_role_in_room(session_id, "human_counselor"):
                 disconnect_event = UserDisconnectedEvent()
                 await manager.broadcast(session_id, disconnect_event.model_dump(), websocket)
 
@@ -636,8 +636,8 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
 
         if role == "human_counselor":
             mark_counselor_disconnected(authenticated_user_id)
-            was_counted_in_room = manager.is_counselor_in_room(session_id, authenticated_user_id)
-            manager.remove_counselor_from_room(session_id, authenticated_user_id)
+            was_counted_in_room = await manager.is_counselor_in_room(session_id, authenticated_user_id)
+            await manager.remove_counselor_from_room(session_id, authenticated_user_id)
 
             if db is not None:
                 if was_counted_in_room:

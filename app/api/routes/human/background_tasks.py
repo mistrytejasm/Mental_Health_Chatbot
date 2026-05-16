@@ -55,7 +55,7 @@ async def _counselor_timeout_watchdog(session_id: str, user_id: str) -> None:
     finally:
         manager.remove_timeout_task(session_id)
 
-    if manager.human_has_joined(session_id):
+    if await manager.human_has_joined(session_id):
         return  # Counselor arrived before timeout — nothing to do
 
     logger.warning(
@@ -273,7 +273,7 @@ async def _notify_assigned_counselor_user_waiting(
             )
             await asyncio.sleep(30)
 
-            if manager.is_role_in_room(session_id, "human_counselor"):
+            if await manager.is_role_in_room(session_id, "human_counselor"):
                 logger.info(
                     f"[NOTIFY] Counselor joined chat room within 30s grace window | session={session_id}"
                 )
@@ -409,7 +409,7 @@ async def _user_inactivity_watchdog(
                 timeout=USER_INACTIVITY_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            if not manager.is_role_in_room(session_id, "human_counselor"):
+            if not await manager.is_role_in_room(session_id, "human_counselor"):
                 return  # No counselor present — let counselor-timeout watchdog handle recovery
 
             logger.warning(
@@ -517,7 +517,7 @@ async def _counsel_reconnect_grace(
     """
     await asyncio.sleep(RECONNECT_GRACE_PERIOD_SECONDS)
 
-    if manager.is_role_in_room(session_id, "human_counselor"):
+    if await manager.is_role_in_room(session_id, "human_counselor"):
         logger.info(
             f"[GRACE] RECONNECTED within grace period — escalation preserved"
             f" | session={session_id} | counselor_id={counselor_id}"

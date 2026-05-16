@@ -16,7 +16,7 @@ so the counselor is pre-briefed before the user-visible chat begins.
 Fix 3:  atomic routing lock now also writes routing_started_at timestamp.
 Fix 14: stale __routing__ locks older than 5 minutes are cleaned up before each
         routing attempt so a server crash cannot permanently block a session.
-Fix 12: _is_available() now also checks connection_registry.is_counselor_connected()
+Fix 12: _is_available() now also checks Redis 'dashboard:online_counselors' set
         so a counselor with a stale is_online flag but no active WebSocket is not routed to.
 
 Entry point: route_crisis_session() — called via asyncio.create_task() from chat.py.
@@ -33,6 +33,7 @@ from app.core.database import get_database
 from app.core.connection_registry import is_counselor_connected
 from app.core.logger import get_logger
 from app.services.summarization_service import generate_clinical_handoff
+from app.core.redis import get_redis
 
 logger = get_logger(__name__)
 
@@ -53,25 +54,31 @@ def _is_fresh(counselor_doc: dict) -> bool:
     return (datetime.now(timezone.utc) - last_ping) < timedelta(seconds=_STALE_PING_SECONDS)
 
 
-def _is_available(counselor_doc: dict) -> bool:
+async def _is_available(counselor_doc: dict) -> bool:
     """
-    Returns True when ALL three gates pass:
+    Returns True when ALL four gates pass:
       1. is_online flag is True in DB
       2. Heartbeat is fresh (last_ping within _STALE_PING_SECONDS)
       3. current_active_sessions < _MAX_CONCURRENT_SESSIONS (has capacity)
-
-    Note: We intentionally do NOT require an active in-memory WebSocket
-    connection (is_counselor_connected).  REST-only counselors (e.g. the
-    docker/counselor dashboard that polls GET /api/human/escalated) keep
-    their DB state fresh via the auto-checkin in that endpoint.  Requiring
-    an in-process WSocket would silently exclude them between poll intervals.
+      4. Registered in Redis 'dashboard:online_counselors' (real-time WS presence)
     """
-    return (
+    db_pass = (
         counselor_doc.get("is_online", False)
         and counselor_doc.get("is_active", True)
         and _is_fresh(counselor_doc)
         and counselor_doc.get("current_active_sessions", 0) < _MAX_CONCURRENT_SESSIONS
     )
+    if not db_pass:
+        return False
+
+    # Check real-time WebSocket presence in Redis
+    redis = get_redis()
+    if redis:
+        counselor_id = str(counselor_doc.get("_id", ""))
+        is_ws_online = await redis.sismember("dashboard:online_counselors", counselor_id)
+        return bool(is_ws_online)
+    
+    return False
 
 
 
@@ -122,7 +129,7 @@ async def _find_available_counselor(exclude_id: Optional[str] = None) -> Optiona
         logger.warning("[ROUTING] [FIFO] No candidates found in queue (no free, checked-in counselors).")
 
     for candidate in candidates:
-        if _is_available(candidate):
+        if await _is_available(candidate):
             cid = str(candidate.get("_id", ""))
             name = f"{candidate.get('first_name', '')} {candidate.get('last_name', '')}".strip() or cid
             logger.info(f"[ROUTING] [FIFO] ✓ Selected FIFO[0] available: {name} (id={cid})")
@@ -151,8 +158,15 @@ async def get_available_counselor_count() -> int:
         ],
         "checked_in_at": {"$exists": True},
     }
-    
-    count = await db.admins.count_documents(query)
+
+    # FIFO: sort by check-in time ascending
+    cursor = db.admins.find(query).sort("checked_in_at", 1)
+    candidates = await cursor.to_list(length=50)
+
+    count = 0
+    for c in candidates:
+        if await _is_available(c):
+            count += 1
     return count
 
 

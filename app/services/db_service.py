@@ -74,7 +74,7 @@ async def retrieve_long_term_memory(
 
         snippets = []
         for doc in docs:
-            role = "User" if doc.get("role") == "user" else "MindBridge"
+            role = "User" if doc.get("role") == "user" else "MindBuddy"
             content = doc.get("content", "")[:200].strip()
             if content:
                 snippets.append(f"{role}: {content}")

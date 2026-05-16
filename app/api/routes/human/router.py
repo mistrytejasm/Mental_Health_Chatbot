@@ -486,8 +486,8 @@ async def get_ws_status(session_id: str, current_user=Depends(get_current_user))
       is_counselor_connected — True if a counselor has an active WebSocket in this room.
       is_socket_connected    — True only when both are simultaneously connected.
     """
-    is_user = manager.is_role_in_room(session_id, "user")
-    is_counselor = manager.is_role_in_room(session_id, "human_counselor")
+    is_user = await manager.is_role_in_room(session_id, "user")
+    is_counselor = await manager.is_role_in_room(session_id, "human_counselor")
     return WebSocketStatusResponse(
         status="success",
         session_id=session_id,
