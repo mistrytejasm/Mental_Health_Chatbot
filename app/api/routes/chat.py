@@ -42,52 +42,7 @@ from app.services.routing_service import get_available_counselor_count
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
-# Phrases that signal the user wants to keep talking to the AI, not a human.
-# Checked against the lowercased message BEFORE the counselor-redirect branch
-# so a mis-fire from the small Llama model cannot trigger an unwanted handoff.
-# Phrases that unambiguously signal the desire to LIVE, not to self-harm.
-# If the small Llama model mis-fires is_crisis=True on a negated death reference
-# (e.g. "I don't want to die"), this guard forces it back to False before
-# the crisis fork is reached.  Only add phrases that are unambiguous — if a
-# phrase could appear inside a genuine crisis message leave it out.
-_ANTI_CRISIS_PHRASES = (
-    # Explicit desire to live / negated death reference
-    "i don't want to die",      "i dont want to die",
-    "i want to live",           "i want to keep living",
-    # Explicit denial of suicidal intent
-    "i'm not suicidal",         "im not suicidal",          "not suicidal",
-    "i'm not thinking about",   "not thinking about hurting",
-    "i don't want to hurt myself", "i dont want to hurt myself",
-    "i won't hurt myself",      "i wont hurt myself",
-    # Fear of death (not suicidal ideation)
-    "i'm scared of dying",      "im scared of dying",
-    "afraid of dying",          "fear of dying",
-    "fear of death",            "scared of death",
-    "afraid of death",
-    # Common vague-distress idioms — distress but NOT self-harm intent
-    "i feel like dying",        "i feel dead inside",
-    "this is killing me",       "killing me",
-    "i want to disappear",      "want to disappear",
-    "i want to escape",         "i want to run away",
-    "i want to end this pain",  "end this suffering",
-    "i can't take this anymore","cant take this anymore",
-    "exhausted of living like",
-)
 
-# Phrases that signal the user wants to keep talking to the AI, not a human.
-# Checked against the lowercased message BEFORE the counselor-redirect branch
-# so a mis-fire from the small Llama model cannot trigger an unwanted handoff.
-_AI_PREFERENCE_PHRASES = (
-    "talk to you only", "talk to you alone", "only want to talk to you",
-    "just want to talk to you", "i want to talk to you", "talk with you only",
-    "don't want a human", "dont want a human", "not a human", "no human",
-    "don't need a counselor", "dont need a counselor", "don't want a counselor",
-    "dont want a counselor", "don't need a therapist", "dont need a therapist",
-    "just listen", "just be there", "just talk to me", "talk for a bit",
-    "check in on me", "be there with me", "be there for me",
-    "i just need someone to listen", "need someone to listen",
-    "don't need you to fix", "dont need you to fix",
-)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -253,6 +208,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
             "type": "escalation_active",
             "handoff_message": "You are currently connected to a human counselor. Please continue in the live chat.",
             "websocket_url": ws_url,
+            "is_crisis": False,
         }
 
         async def _redirect_stream():
@@ -316,26 +272,19 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
             text=req.message,
             roberta_emotion=emotion_result.dominant if emotion_result else "neutral",
             roberta_score=sadness_now,
+            history=recent_history_str or None,
         )
         logger.info(
             f"[STEP 2 OK] crisis: {consensus.get('is_crisis')} | "
+            f"wants_counselor: {consensus.get('wants_counselor')} | "
             f"category: {consensus.get('category')}"
         )
     except Exception as e:
         logger.error(f"[STEP 2 ERROR] {e}")
         consensus = _safe_fallback_consensus()
 
-    _msg_lower = req.message.lower()
-
-    # ── Anti-crisis guard — suppress false-positive crisis on negated/fear phrases ──
-    if consensus.get("is_crisis") is True and any(p in _msg_lower for p in _ANTI_CRISIS_PHRASES):
-        logger.info(f"[CRISIS_GUARD] Suppressed false-positive crisis — anti-crisis phrase detected: '{req.message[:80]}'")
-        consensus["is_crisis"] = False
-
-    # ── Counselor request detection — user explicitly asked for a human ───────
-    if consensus.get("wants_counselor") is True and any(p in _msg_lower for p in _AI_PREFERENCE_PHRASES):
-        logger.info(f"[COUNSELOR_REQUEST] Suppressed — user message indicates AI preference: '{req.message[:80]}'")
-        consensus["wants_counselor"] = False
+    # ── Nuance handling now managed by context-aware LLM in synthesize_consensus ──
+    is_message_crisis = bool(consensus.get("is_crisis", False))
 
     if consensus.get("wants_counselor") is True and not consensus.get("is_crisis"):
         logger.info(f"[COUNSELOR_REQUEST] User {user_id} requested a human counselor.")
@@ -347,6 +296,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
             "type": "counselor_request",
             "message": "Of course — you can connect with a human counselor anytime using the button in the top right corner 👤.",
             "button_icon_url": f"{_base_url}/static/images/connect_counselor_btn.png",
+            "is_crisis": is_message_crisis,
         }
 
         async def _counselor_request_stream():
@@ -388,6 +338,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
                 "done": True,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "text": hotline_text,
+                "is_crisis": True,
             }
             async def _hotline_stream():
                 yield f"data: {json.dumps(hotline_payload)}\n\n"
@@ -422,6 +373,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
                 "intensity": consensus.get("intensity", "high"),
                 "is_crisis_signal": True,
             },
+            "is_crisis": True,
         }
 
         async def _crisis_stream():
@@ -445,7 +397,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
                 long_term_memory=long_term_memory,
             ):
                 full_reply.append(chunk)
-                yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+                yield f"data: {json.dumps({'chunk': chunk, 'is_crisis': is_message_crisis})}\n\n"
 
             emotion_dict = {
                 "dominant_emotion":  emotion_result.dominant if emotion_result else "neutral",
@@ -457,6 +409,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
                 "done": True,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "emotion": emotion_dict,
+                "is_crisis": is_message_crisis,
             }
             yield f"data: {json.dumps(done_payload)}\n\n"
 

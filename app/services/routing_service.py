@@ -38,6 +38,7 @@ logger = get_logger(__name__)
 
 _STALE_PING_SECONDS = 2100  # 35 minutes — counselor stays visible while idle
 _STALE_LOCK_MINUTES = 5
+_MAX_CONCURRENT_SESSIONS = 2
 
 
 # ── Tier helpers ─────────────────────────────────────────────────────────────
@@ -57,7 +58,7 @@ def _is_available(counselor_doc: dict) -> bool:
     Returns True when ALL three gates pass:
       1. is_online flag is True in DB
       2. Heartbeat is fresh (last_ping within _STALE_PING_SECONDS)
-      3. current_active_sessions == 0 (not currently in an active chat)
+      3. current_active_sessions < _MAX_CONCURRENT_SESSIONS (has capacity)
 
     Note: We intentionally do NOT require an active in-memory WebSocket
     connection (is_counselor_connected).  REST-only counselors (e.g. the
@@ -69,40 +70,11 @@ def _is_available(counselor_doc: dict) -> bool:
         counselor_doc.get("is_online", False)
         and counselor_doc.get("is_active", True)
         and _is_fresh(counselor_doc)
-        and counselor_doc.get("current_active_sessions", 0) == 0
+        and counselor_doc.get("current_active_sessions", 0) < _MAX_CONCURRENT_SESSIONS
     )
 
 
-_CATEGORY_GROUPS: list[frozenset] = [
-    frozenset({"suicidal_ideation", "self_harm", "suicide_attempt"}),
-    frozenset({"anxiety", "panic_attack", "ocd", "ptsd"}),
-    frozenset({"depression", "grief", "hopelessness"}),
-    frozenset({"substance_abuse", "addiction"}),
-    frozenset({"psychosis", "schizophrenia", "bipolar"}),
-    frozenset({"relationship_crisis", "domestic_abuse", "isolation"}),
-    frozenset({"eating_disorder", "body_image"}),
-]
 
-
-def _categories_match(current: str, previous: Optional[str]) -> bool:
-    """Returns True if previous counselor's category is compatible with the current crisis.
-    Uses a category hierarchy so related crises (e.g. suicidal_ideation + self_harm)
-    are treated as compatible rather than requiring exact string equality.
-
-    'manual_escalation' and 'unknown' are always compatible with any previous category
-    so users who escalate manually or whose category is undetected always reconnect
-    with their trusted previous counselor if that counselor is available.
-    """
-    if previous is None:
-        return True
-    if current == previous:
-        return True
-    if current in ("manual_escalation", "unknown"):
-        return True
-    for group in _CATEGORY_GROUPS:
-        if current in group and previous in group:
-            return True
-    return False
 
 
 async def _find_available_counselor(exclude_id: Optional[str] = None) -> Optional[dict]:
@@ -120,7 +92,7 @@ async def _find_available_counselor(exclude_id: Optional[str] = None) -> Optiona
         "is_active": {"$ne": False},
         "last_ping": {"$gte": stale_cutoff},
         "$or": [
-            {"current_active_sessions": 0},
+            {"current_active_sessions": {"$lt": _MAX_CONCURRENT_SESSIONS}},
             {"current_active_sessions": {"$exists": False}}
         ],
         "checked_in_at": {"$exists": True},
@@ -173,19 +145,14 @@ async def get_available_counselor_count() -> int:
         "is_online": True,
         "is_active": {"$ne": False},
         "last_ping": {"$gte": stale_cutoff},
+        "$or": [
+            {"current_active_sessions": {"$lt": _MAX_CONCURRENT_SESSIONS}},
+            {"current_active_sessions": {"$exists": False}}
+        ],
+        "checked_in_at": {"$exists": True},
     }
     
-    # Fetch a batch and check for active WebSockets
-    cursor = db.admins.find(query).limit(50)
-    candidates = await cursor.to_list(length=50)
-
-    count = 0
-    for candidate in candidates:
-        active = candidate.get("current_active_sessions", 0)
-        max_cap = candidate.get("max_concurrent_sessions", 3)
-        if active < max_cap:
-            count += 1
-
+    count = await db.admins.count_documents(query)
     return count
 
 
@@ -272,12 +239,11 @@ async def route_crisis_session(user_id: str, session_id: str, consensus: dict) -
             except Exception:
                 preferred_doc = None
             if preferred_doc:
-                # ── Tier 2: Context Match ────────────────────────────────────
-                if _categories_match(crisis_category, user_doc.get("last_crisis_category")):
-                    # ── Tier 3: Availability Gate ────────────────────────────
-                    if _is_available(preferred_doc):
-                        assigned_counselor = preferred_doc
-                        logger.info(f"[ROUTING] Preferred counselor {preferred_id} selected for session {session_id}.")
+                # ── Tier 2 (Context) removed per user instructions ───────────
+                # ── Tier 3: Availability Gate ────────────────────────────
+                if _is_available(preferred_doc):
+                    assigned_counselor = preferred_doc
+                    logger.info(f"[ROUTING] Preferred counselor {preferred_id} selected for session {session_id}.")
 
         # ── Fallback: Pool Search ─────────────────────────────────────────────
         if assigned_counselor is None:

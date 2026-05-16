@@ -535,7 +535,7 @@ def _ensure_utc(ts) -> Optional[datetime]:
     return ts.replace(tzinfo=timezone.utc)
 
 
-async def get_user_messages(user_id: str, limit: int = 300) -> List[Dict]:
+async def get_user_messages(user_id: str, limit: int = 500) -> List[Dict]:
     """
     Retrieves the most recent `limit` messages for a given user_id.
     Capped to prevent unbounded queries that cause gateway timeouts (502).
@@ -547,9 +547,14 @@ async def get_user_messages(user_id: str, limit: int = 300) -> List[Dict]:
         return []
 
     try:
+        from bson import ObjectId
+        # Support both String and ObjectId user_id formats in the database
+        query = {"user_id": user_id}
+        if ObjectId.is_valid(user_id):
+            query = {"$or": [{"user_id": user_id}, {"user_id": ObjectId(user_id)}]}
+
         # Fetch newest `limit` messages first (descending), then reverse for chronological order.
-        # This avoids a full collection scan on large message sets.
-        cursor = db.messages.find({"user_id": user_id}).sort("timestamp", -1).limit(limit)
+        cursor = db.messages.find(query).sort("timestamp", -1).limit(limit)
         docs = await cursor.to_list(length=limit)
         docs.reverse()
 

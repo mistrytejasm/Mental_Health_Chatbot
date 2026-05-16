@@ -32,7 +32,7 @@ from app.core.auth.oauth2 import get_current_user
 from app.core.connection_registry import is_counselor_connected, mark_counselor_connected, mark_counselor_disconnected
 from app.core.database import get_database
 from app.core.logger import get_logger
-from app.services.db_service import _ensure_utc
+from app.services.db_service import _ensure_utc, get_user_messages
 
 from .background_tasks import _generate_and_save_post_session_summaries
 from .connection_manager import manager
@@ -282,28 +282,9 @@ async def get_escalated_session_messages(
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection failed.")
 
-    session_info = await db.sessions.find_one({"user_id": user_id}, sort=[("created_at", -1)])
-    if not session_info:
-        messages = []
-    else:
-        docs = await db.messages.find(
-            {"session_id": session_info["session_id"]}
-        ).sort("timestamp", 1).to_list(length=None)
-
-        messages = []
-        for doc in docs:
-            # Skip internal system/routing messages
-            if doc.get("role") == "system" or doc.get("sender_type") == "system":
-                continue
-            if doc.get("content"):
-                messages.append({
-                    "session_id": doc.get("session_id", "unknown"),
-                    "role": doc.get("role", "unknown"),
-                    "content": doc.get("content", ""),
-                    "timestamp": _ensure_utc(doc.get("timestamp")),
-                    "user_id": user_id,
-                })
-
+    # Fetch cross-session history for the user (AI + Counselor messages)
+    messages = await get_user_messages(user_id, limit=500)
+    
     formatted = [ChatMessageResponse(**msg) for msg in messages]
     return ChatHistoryResponse(
         status="success",

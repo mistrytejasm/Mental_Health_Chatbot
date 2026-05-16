@@ -20,9 +20,12 @@ from app.core.config import get_settings
 from app.core.database import close_mongo_connection, connect_to_mongo, get_database
 from app.core.logger import get_logger
 from app.services.emotion import warmup
+import os
 
 logger = get_logger("main")
 settings = get_settings()
+origins = os.getenv("ALLOWED_ORIGINS", "").split(",")
+
 
 
 # ── Application Lifespan ──────────────────────────────────────────────────────
@@ -86,11 +89,19 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https?://.*",  # Permissive for local network development
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origin_regex=r"https?://.*",  # Permissive for local network development
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
 
 
 # ── Exception Handlers ────────────────────────────────────────────────────────

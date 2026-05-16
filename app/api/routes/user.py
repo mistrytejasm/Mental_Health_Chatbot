@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pydantic import ValidationError
 from app.core.auth.oauth2 import get_current_user
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from passlib.context import CryptContext
+
 
 token_auth_scheme = HTTPBearer()
 
@@ -61,7 +61,7 @@ from app.services.email_service import generate_otp, validate_email, send_otp_em
 from app.services.db_service import get_existing_session, upsert_session
 from app.services import llm as llm_svc
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -387,7 +387,7 @@ async def user_login(payload: UserLoginRequest):
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
         stored_hash = user_doc.get("password_hash")
-        if not stored_hash or not await run_in_threadpool(pwd_context.verify, payload.password, stored_hash):
+        if not stored_hash or not await run_in_threadpool(Hash.checkpw, payload.password, stored_hash):
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
         if not user_doc.get("is_active", True):
