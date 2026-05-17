@@ -291,7 +291,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
             "done": True,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": "crisis_escalation",
-            "handoff_message": "A counselor is joining shortly... you're not alone.",
+            "handoff_message": "Connecting you to our specialized support team. Please stay on this screen.",
             "websocket_url": _ws_url,
             "emotion": {
                 "dominant_emotion": emotion_result.dominant if emotion_result else "neutral",

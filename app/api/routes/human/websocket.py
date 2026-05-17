@@ -420,9 +420,9 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
     # ── 9. Counselor: update presence and send handoff brief ──────────────────
     if role == "human_counselor":
         mark_counselor_connected(authenticated_user_id)
-        is_first_tab_for_session = await manager.add_counselor_to_room(
-            session_id, authenticated_user_id
-        )
+        active_counselor_tabs = await manager.get_role_count(session_id, "human_counselor")
+        has_joined_before = await manager.human_has_joined(session_id)
+        should_send_join_notice = not has_joined_before
 
         if db is not None:
             # Update counselor presence in DB
@@ -538,7 +538,7 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
         # Broadcast join notice to the patient
         # Fix: Ensure this only happens once per session to avoid duplicate notices
         # if the counselor opens multiple tabs.
-        if is_first_tab_for_session:
+        if should_send_join_notice:
             join_event = SystemNoticeEvent(
                 role="human_counselor",
                 counselor_name=counselor_display_name,
@@ -627,7 +627,7 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
                 "is_human_message": is_counselor_message,
             })
 
-            await manager.broadcast(session_id, outbound_event.model_dump(), sender_ws=None)
+            await manager.broadcast(session_id, outbound_event.model_dump(), sender_ws=websocket)
 
     except WebSocketDisconnect:
         await manager.disconnect(session_id, websocket)

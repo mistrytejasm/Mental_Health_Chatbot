@@ -370,7 +370,7 @@ async def route_crisis_session(user_id: str, session_id: str, consensus: dict) -
                 {"current_active_sessions": {"$exists": False}},
             ],
             "checked_in_at": {"$exists": True},
-            "_id": {"$ne": assigned_counselor["_id"]},
+            "_id": {"$ne": ObjectId(assigned_counselor["_id"])},
         }
         extra_cursor = db.admins.find(extra_query).sort([
             ("current_active_sessions", 1), ("checked_in_at", 1)
@@ -381,23 +381,27 @@ async def route_crisis_session(user_id: str, session_id: str, consensus: dict) -
         for candidate in candidates_to_try:
             cid = str(candidate["_id"])
             try:
+                # ATOMIC CLAIM: Try to increment only if current < MAX
                 claim_result = await db.admins.update_one(
                     {
                         "_id": candidate["_id"],
+                        "is_online": True,
                         "$or": [
                             {"current_active_sessions": {"$lt": _MAX_CONCURRENT_SESSIONS}},
                             {"current_active_sessions": {"$exists": False}},
+                            {"current_active_sessions": 0},
                         ],
                     },
                     {"$inc": {"current_active_sessions": 1}},
                 )
+
                 if claim_result.modified_count == 1:
                     final_counselor_id_str = cid
                     assigned_counselor = candidate
                     claimed = True
                     logger.info(
-                        f"[ROUTING] ✓ Capacity slot atomically claimed for counselor {cid} "
-                        f"(session={session_id})."
+                        f"[ROUTING] ✓ Capacity slot ATOMICALLY claimed"
+                        f" | counselor={cid} | session={session_id}"
                     )
                     break
                 else:

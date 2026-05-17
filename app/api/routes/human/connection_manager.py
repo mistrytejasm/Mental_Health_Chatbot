@@ -117,10 +117,16 @@ class ConnectionManager:
                 await redis.hdel(f"session:{session_id}:roles", role)
 
     async def is_role_in_room(self, session_id: str, role: str) -> bool:
+        count = await self.get_role_count(session_id, role)
+        return count > 0
+
+    async def get_role_count(self, session_id: str, role: str) -> int:
         redis = get_redis()
-        if not redis: return False
+        if not redis:
+            # Local fallback
+            return sum(1 for r in self.ws_roles_local.values() if r == role)
         count = await redis.hget(f"session:{session_id}:roles", role)
-        return int(count) > 0 if count else False
+        return int(count) if count else 0
 
     # ── Presence flags (Redis) ────────────────────────────────────────────────
     async def mark_human_joined(self, session_id: str) -> None:
@@ -237,8 +243,20 @@ class ConnectionManager:
                         self.rooms.pop(session_id, None)
                         
         except asyncio.CancelledError:
-            await pubsub.unsubscribe(channel)
-            await pubsub.close()
+            try:
+                await pubsub.unsubscribe(channel)
+                await pubsub.close()
+            except Exception:
+                pass
+        except Exception as exc:
+            logger.error(f"[WS] PubSub listener crashed | session={session_id} | error={exc}", exc_info=True)
+            try:
+                await pubsub.unsubscribe(channel)
+                await pubsub.close()
+            except Exception:
+                pass
+            # Task died, remove from tracking so it can be recreated if needed
+            self.pubsub_tasks.pop(session_id, None)
 
     # ── Message broadcasting ──────────────────────────────────────────────────
     async def broadcast(self, session_id: str, payload: dict, sender_ws: Optional[WebSocket] = None) -> None:

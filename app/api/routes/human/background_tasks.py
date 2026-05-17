@@ -33,7 +33,7 @@ logger = get_logger(__name__)
 # ── Timing constants ──────────────────────────────────────────────────────────
 
 COUNSELOR_JOIN_TIMEOUT_SECONDS = 1200  # 20 min: max wait for counselor to join after user connects
-USER_INACTIVITY_TIMEOUT_SECONDS = 1800  # 30 min: max user silence before auto-close
+USER_INACTIVITY_TIMEOUT_SECONDS = 1800  # 30 minutes: max user silence before auto-close
 GLOBAL_INACTIVITY_TIMEOUT_MINUTES = 60  # 60 min: max session inactivity before watchdog closes it
 HEARTBEAT_INTERVAL_SECONDS = 20         # How often to refresh counselor last_ping in DB
 RECONNECT_GRACE_PERIOD_SECONDS = 120    # 2 min window for counselor to reconnect after a drop
@@ -274,63 +274,8 @@ async def _notify_assigned_counselor_user_waiting(
                 f" | session={session_id} | counselor_id={assigned_counselor_id}"
             )
         
-        # H-5: Always wait for the counselor to actually join the room.
-        # Previously, if 'delivered' was True, it would exit immediately!
-        logger.info(f"[NOTIFY] Waiting 120s for counselor {assigned_counselor_id} to join session {session_id}")
-        await asyncio.sleep(120)
-
-        if await manager.is_role_in_room(session_id, "human_counselor"):
-            logger.info(
-                f"[NOTIFY] Counselor joined chat room within grace window | session={session_id}"
-            )
-            return
-
-            db = get_database()
-            if db is not None:
-                fresh_doc = await db.sessions.find_one({"session_id": session_id})
-                if (fresh_doc or {}).get("assignment_complete"):
-                    logger.info(
-                        f"[NOTIFY] assignment_complete=True in DB — counselor connected | session={session_id}"
-                    )
-                    return
-                if not (fresh_doc or {}).get("is_escalated", True):
-                    logger.info(
-                        f"[NOTIFY] Session no longer escalated — skipping re-route | session={session_id}"
-                    )
-                    return
-
-            logger.warning(
-                f"[NOTIFY] Counselor did not connect within 120s — triggering re-route"
-                f" | session={session_id} | excluded_counselor={assigned_counselor_id}"
-            )
-            
-            # Notify user that we are still looking for a counselor
-            await manager.send_to_all(session_id, {
-                "role": "system",
-                "text": "The assigned counselor is unavailable. We are connecting you to another counselor now. Please stay with us.",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "is_human": False,
-                "is_system": True,
-                "type": "counselor_rerouting",
-            })
-
-            from app.services.routing_service import route_crisis_session
-            db = get_database()
-            if db is not None:
-                await db.sessions.update_one(
-                    {"session_id": session_id},
-                    {"$set": {"assigned_counselor_id": None}},
-                )
-            reroute_consensus = {
-                "category": session_doc.get("crisis_category", "unknown") if session_doc else "unknown",
-                "is_crisis": True,
-                "_exclude_counselor_id": assigned_counselor_id,
-            }
-            asyncio.create_task(
-                route_crisis_session(
-                    user_id=user_id, session_id=session_id, consensus=reroute_consensus
-                )
-            )
+        # Delivery attempt finished. The global _counselor_timeout_watchdog (running for 20 mins)
+        # will handle re-routing if the counselor never joins.
     else:
         logger.info(
             f"[NOTIFY] Skipping patient-waiting push — no counselor assigned yet | session={session_id}"
@@ -540,16 +485,22 @@ async def _counsel_reconnect_grace(
             f" | session={session_id} | counselor_id={counselor_id}"
         )
         return
+    db = get_database()
+    if db is None:
+        return
 
+    counselor_doc = await db.admins.find_one({"_id": ObjectId(counselor_id)})
+    if counselor_doc and counselor_doc.get("is_online", False):
+        logger.info(
+            f"[GRACE] Counselor is still online (likely managing another tab) — escalation preserved"
+            f" | session={session_id} | counselor_id={counselor_id}"
+        )
+        return
     logger.warning(
         f"[GRACE] EXPIRED — counselor did not reconnect; closing escalation"
         f" | session={session_id} | counselor_id={counselor_id}"
         f" | grace_window={RECONNECT_GRACE_PERIOD_SECONDS}s"
     )
-
-    db = get_database()
-    if db is None:
-        return
 
     try:
         session_doc = await db.sessions.find_one({"session_id": session_id})
