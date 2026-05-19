@@ -1,20 +1,36 @@
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from app.core.logger import get_logger
+"""
+OAuth2 / HTTP Bearer Authentication Dependency
+────────────────────────────────────────────────
+Provides the `get_current_user` FastAPI dependency used by all protected routes.
+Extracts the Bearer token from the Authorization header, verifies it via
+jwt_handler, and returns a user context dict for downstream use.
+"""
 
-from app.core.auth.JWTtoken import verify_token
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+from app.core.auth.jwt_handler import verify_token
+from app.core.logger import get_logger
 
 logger = get_logger(__name__)
 
-token_auth_scheme = HTTPBearer()
+_bearer_scheme = HTTPBearer()
 
 
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(token_auth_scheme)):
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer_scheme),
+) -> dict:
+    """
+    FastAPI dependency that validates the Bearer token and returns a user context dict.
+
+    Returns:
+        dict with keys: _id, user_id, email, role, token
+    """
     token = credentials.credentials
 
-    # Fix Swagger double "Bearer Bearer"
+    # Guard against clients that accidentally double-prefix with "Bearer "
     if token.startswith("Bearer "):
-        token = token.split(" ")[1]
+        token = token.split(" ", 1)[1]
 
     logger.debug(f"Token received for validation: {token[:8]}...")
 
@@ -24,17 +40,12 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(t
         headers={"WWW-Authenticate": "Bearer"},
     )
 
-    # Decode + validate token
     token_data = await verify_token(token, credentials_exception)
 
-    # ✅ FIXED: use user_id as primary key
-    user_doc = {
+    return {
         "_id": token_data.user_id,
         "user_id": token_data.user_id,
         "email": token_data.email,
-        # "useremail": token_data.email,  # optional (keep if your code expects it)
         "role": token_data.role,
-        "token": token  # IMPORTANT for logout
+        "token": token,
     }
-
-    return user_doc

@@ -12,11 +12,14 @@ LLM call never blocks the routing engine or the user-facing SSE stream.
 """
 
 import logging
+
 from openai import AsyncOpenAI
+
 from app.core.config import get_settings
 from app.core.database import get_database
+from app.core.logger import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 async def generate_clinical_handoff(

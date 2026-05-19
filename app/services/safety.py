@@ -43,9 +43,7 @@ _CRISIS_KEYWORDS: tuple[str, ...] = (
     "i am going to die",    "i'm going to die",
     "end my life",          "end it all",
     "take my life",         "taking my life",
-    "hurt myself",          "hurting myself",       "harm myself",
-    "cut myself",           "cutting myself",
-    "suicide",              "suicidal",
+    "cutting myself",
     "want to kill myself",  "going to kill myself",  "going to end my life",
     "plan to end my life",  "thinking of ending my life",
     "no reason to live",    "not worth living",
@@ -94,89 +92,49 @@ def _pre_screen(text: str) -> tuple[bool | None, bool | None]:
     return (True if crisis else None, True if counselor else None)
 
 
-async def synthesize_consensus(text: str, roberta_emotion: str, roberta_score: float) -> dict:
+async def synthesize_consensus(text: str, roberta_emotion: str, roberta_score: float, history: str | None = None) -> dict:
     """
     Executes the LLM Sentiment & Crisis Synthesizer (GPT-4o-mini).
     Returns a structured dictionary with:
       - llm_sentiment: The verified emotional state
       - category: The dynamic conversational theme (e.g. 'burnout', 'grief')
       - is_crisis: True if active suicidal ideation or threat to life
+      - wants_counselor: True if the user wants to speak with a human
       - reasoning: Explanation for the synthesis
-
-    Pre-screen runs first: unambiguous crisis/counselor keywords bypass the LLM
-    so short or blunt signals ("die", "kill myself") are never silently dropped.
     """
     # ── Step 1: deterministic pre-screen ─────────────────────────────────────
+    # We still use a small pre-screen for BLUNT, UNAMBIGUOUS signals to ensure
+    # speed and prevent probabilistic "swallowing" of direct crisis words.
     forced_crisis, forced_counselor = _pre_screen(text)
-
-    if forced_crisis:
-        logger.warning(
-            f"[SAFETY] Pre-screen: crisis keyword matched — forcing is_crisis=True | text='{text[:80]}'"
-        )
-    if forced_counselor:
-        logger.info(
-            f"[SAFETY] Pre-screen: counselor keyword matched — forcing wants_counselor=True | text='{text[:80]}'"
-        )
 
     # ── Step 2: LLM consensus ────────────────────────────────────────────────
     client = _get_client()
 
     system_prompt = (
-        "You are an expert clinical sentiment analyzer and crisis triage AI.\n"
-        "Your job is to read the user's text and the raw statistical emotion provided by an NLP model, "
-        "and synthesize them into a logical consensus.\n"
-        "You must respond in strictly valid JSON with exactly these keys:\n"
+        "You are a Clinical Crisis Triage AI. Your goal is to analyze user text and conversation context "
+        "to determine if there is an ACTIVE crisis (suicidal intent, self-harm plan) or a request for human help.\n\n"
+        
+        "You must respond in strictly valid JSON:\n"
         '{"llm_sentiment": "string", "category": "string", "is_crisis": boolean, "wants_counselor": boolean, "reasoning": "string"}\n\n'
-        "RULES:\n\n"
 
-        "1. CATEGORY: Identify the emotional theme freely (e.g. 'severe_burnout', 'relationship_conflict', "
-        "'financial_stress', 'grief', 'anxiety', 'loneliness', 'suicidal_ideation').\n\n"
+        "CRITICAL RULES FOR IS_CRISIS:\n"
+        "1. CONTEXT IS KING: Use the provided 'Conversation History' to understand ambiguous answers (e.g., if the user says 'yes' to 'Do you have a plan?').\n"
+        "2. NEGATION DETECTION: Set is_crisis=false if the user is expressing a desire to live or denying intent (e.g., 'I don't want to die', 'I'm not suicidal', 'I want to stay alive').\n"
+        "3. IDIOM DETECTION: Distinguish between metaphors ('this is killing me', 'I feel dead inside') and literal intent.\n"
+        "4. FEAR vs INTENT: 'I'm scared of dying' is NOT a crisis. 'I want to die' IS a crisis.\n"
+        "5. INTENT/PLAN: Any expression of current intent, plan, or desire to end one's life or self-harm must be is_crisis=true.\n"
+        "6. GREETINGS: Do NOT set is_crisis=true for isolated greetings (e.g., 'hi', 'hello', 'hey', 'good morning') even if the history contains a past crisis. Only escalate if the current message continues the crisis or expresses new distress.\n"
+        "7. INFORMATIONAL/ADVICE/COPING REQUESTS: Do NOT set is_crisis=true if the user is asking for general information, definitions, advice, coping strategies, or guidance regarding thoughts of self-harm or suicide (e.g., 'how can I manage suicidal thoughts', 'is it possible to get advice on self-harm thoughts'). Only escalate if they express a personal, active plan, intent, or imminent danger to harm themselves right now.\n\n"
 
-        "2. IS_CRISIS — set true when the user expresses ANY intent or desire to self-harm, die, or end "
-        "their life, even as a single word or short phrase.\n"
-        "   TRUE (is_crisis=true) — set true for ALL of these:\n"
-        "     - Single words/phrases: 'die', 'dying', 'suicide', 'suicidal', 'end it', 'end it all'\n"
-        "     - 'I want to kill myself' / 'kill myself'\n"
-        "     - 'I am going to end my life' / 'end my life'\n"
-        "     - 'I have a plan to suicide'\n"
-        "     - 'I want to hurt myself' / 'hurt myself'\n"
-        "     - 'I've been cutting myself' / 'cutting myself'\n"
-        "     - 'I want to die' / 'want to die' / 'wanna die'\n"
-        "     - 'no reason to live', 'not worth living', 'better off dead'\n"
-        "     - 'I can't go on', 'I don't want to be here anymore'\n\n"
-        "   FALSE — NEVER set is_crisis=true for these even though they mention death, pain, or ending:\n"
-        "     NEGATIONS (desire to live): 'I don't want to die', 'I want to live', "
-        "'I'm not suicidal', 'I don't want to hurt myself'\n"
-        "     FEAR (not intent): 'I'm scared of dying', 'I'm afraid of death'\n"
-        "     IDIOMS/METAPHORS: 'this is killing me', 'dying of embarrassment', 'dying of laughter'\n"
-        "     VAGUE DISTRESS (no self-harm intent): 'I feel like dying', 'I feel dead inside', "
-        "'I want to disappear', 'I want to escape', 'I want to end this pain'\n"
-        "     PAST TENSE: 'I used to think about suicide' (past, not present plan)\n\n"
-        "   AMBIGUOUS RULE: If the text contains both a crisis phrase AND a negation/fear qualifier, "
-        "the negation wins — keep is_crisis=false.\n"
-        "   DEFAULT: When genuinely uncertain and no keyword matches, set is_crisis=false.\n\n"
-
-        "3. WANTS_COUNSELOR — set true when the user asks to speak with a human, counselor, "
-        "therapist, doctor, or real person, even without using the exact word 'counselor'.\n"
-        "   TRUE (wants_counselor=true):\n"
-        "     - 'I want to talk to a human' / 'talk to human'\n"
-        "     - 'I want to talk to a real person / human'\n"
-        "     - 'Can I speak to a counselor / therapist / doctor?'\n"
-        "     - 'Connect me to a human' / 'get me a human'\n"
-        "     - 'I want professional help'\n"
-        "     - 'Is there a real person I can talk to?'\n"
-        "     - 'I want to talk to a human counselor'\n\n"
-        "   FALSE — NEVER set wants_counselor=true for:\n"
-        "     TALKING TO AI: 'just listen to me', 'stay with me', 'be there for me'\n"
-        "     AI PREFERENCE: 'I only want to talk to you', 'I don't want a human'\n"
-        "     VAGUE REQUESTS: 'I need help', 'can someone help me'\n"
-        "     NO FIX NEEDED: 'I just need someone to listen'\n\n"
-        "   DEFAULT: Any ambiguity → wants_counselor=false.\n\n"
-
-        "4. REASONING: One sentence explaining the is_crisis decision."
+        "CRITICAL RULES FOR WANTS_COUNSELOR:\n"
+        "1. CURRENT MESSAGE ONLY: Evaluate ONLY the 'Current User Text' to determine if they want a counselor. Do NOT set wants_counselor=true if they only asked in the Conversation History but not in the current message.\n"
+        "2. EXPLICIT REQUESTS: Set wants_counselor=true if the Current User Text explicitly asks for a person, human, counselor, doctor, or therapist.\n"
+        "3. AI PREFERENCE: Set wants_counselor=false if the user explicitly states they want to talk ONLY to you/AI (e.g., 'I don't want a human', 'just talk to me', 'I only trust you').\n"
+        "4. AMBIGUITY: If the user says 'I need help', check history. If it's help with a problem, keep false. If they want 'someone to talk to', keep false unless they specify a person.\n"
     )
 
-    user_prompt = f"User Text: \"{text}\"\nRaw RoBERTa Emotion: {roberta_emotion} (score: {roberta_score:.2f})"
+    history_block = f"\nConversation History:\n{history}\n" if history else ""
+    user_prompt = f"{history_block}Current User Text: \"{text}\"\nRaw Emotion Model Data: {roberta_emotion} (score: {roberta_score:.2f})"
 
     try:
         response = await client.chat.completions.create(
@@ -186,22 +144,16 @@ async def synthesize_consensus(text: str, roberta_emotion: str, roberta_score: f
                 {"role": "user", "content": user_prompt}
             ],
             response_format={"type": "json_object"},
-            temperature=0.1,
-            max_tokens=250,
+            temperature=0.0, # Zero temperature for max consistency
+            max_tokens=300,
         )
 
         content = response.choices[0].message.content
         result = json.loads(content)
 
-        # Pre-screen overrides always win — they are deterministic and cannot be
-        # contradicted by the probabilistic LLM output.
+        # Pre-screen overrides still apply for blunt force safety
         is_crisis = forced_crisis if forced_crisis is not None else bool(result.get("is_crisis", False))
         wants_counselor = forced_counselor if forced_counselor is not None else bool(result.get("wants_counselor", False))
-
-        if is_crisis:
-            logger.warning(f"[SAFETY] Crisis confirmed | reasoning: {result.get('reasoning')}")
-        if wants_counselor:
-            logger.info("[SAFETY] User requested a human counselor.")
 
         return {
             "llm_sentiment":    result.get("llm_sentiment", "unknown"),

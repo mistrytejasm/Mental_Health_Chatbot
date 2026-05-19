@@ -1,14 +1,26 @@
 import asyncio
-import logging
-from typing import List, Dict, Optional
-from datetime import datetime, timezone
-from openai import AsyncOpenAI
-from app.core.database import get_database
-from app.core.config import get_settings
-from datetime import timedelta
+import json
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+from openai import AsyncOpenAI
+
+from app.core.config import get_settings
+from app.core.database import get_database
+from app.core.logger import get_logger
+from app.core.redis import get_redis
+
+logger = get_logger(__name__)
 settings = get_settings()
+
+# MEDIUM-5: Singleton OpenAI client — one HTTP connection pool shared across all calls.
+_openai_client: Optional[AsyncOpenAI] = None
+
+def _get_openai_client() -> AsyncOpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    return _openai_client
 
 
 # ── Embeddings ────────────────────────────────────────────────────────────────
@@ -16,12 +28,12 @@ settings = get_settings()
 async def generate_embedding(text: str) -> List[float]:
     """
     Converts text into a 1536-dimensional vector using OpenAI's
-    text-embedding-3-small model. This is the cheapest, fastest model
-    and is more than sufficient for RAG chat retrieval.
+    text-embedding-3-small model. Uses a singleton client to avoid creating
+    a new HTTP connection pool on every call (MEDIUM-5).
     Returns empty list on failure (embedding is non-critical).
     """
     try:
-        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        client = _get_openai_client()
         response = await client.embeddings.create(
             input=text,
             model="text-embedding-3-small",
@@ -73,7 +85,7 @@ async def retrieve_long_term_memory(
 
         snippets = []
         for doc in docs:
-            role = "User" if doc.get("role") == "user" else "MindBridge"
+            role = "User" if doc.get("role") == "user" else "MindBuddy"
             content = doc.get("content", "")[:200].strip()
             if content:
                 snippets.append(f"{role}: {content}")
@@ -228,12 +240,16 @@ async def get_session_history(session_id: str, limit: int = 20) -> list:
 
 
 async def upsert_session(user_id: str, session_id: str) -> Optional[dict]:
-    """Creates a session document if it does not exist, then returns it."""
+    """Creates a session document if it does not exist, then returns it.
+    H-1: Uses find_one_and_update with return_document=AFTER to avoid a
+    separate find_one round-trip after the upsert.
+    """
     db = get_database()
     if db is None:
         return None
+    from pymongo import ReturnDocument
     try:
-        await db.sessions.update_one(
+        doc = await db.sessions.find_one_and_update(
             {"session_id": session_id},
             {"$setOnInsert": {
                 "session_id": session_id,
@@ -245,8 +261,9 @@ async def upsert_session(user_id: str, session_id: str) -> Optional[dict]:
                 "updated_at": datetime.now(timezone.utc),
             }},
             upsert=True,
+            return_document=ReturnDocument.AFTER,
         )
-        return await db.sessions.find_one({"session_id": session_id})
+        return doc
     except Exception as e:
         logger.error(f"upsert_session failed for session {session_id}: {e}")
         return None
@@ -376,16 +393,18 @@ async def close_escalation_by_user(user_id: str) -> bool:
 async def is_session_escalated(session_id: str) -> bool:
     """
     Checks whether a session is currently under human control.
-    Used by chat.py to block AI responses during active human intervention.
+    MEDIUM-2: Projects only the `is_escalated` field to avoid transferring
+    the full document over the network on every check.
     """
     db = get_database()
     if db is None:
         return False
     try:
-        doc = await db.sessions.find_one({"session_id": session_id})
-        if doc and doc.get("is_escalated") is True:
-            return True
-        return False
+        doc = await db.sessions.find_one(
+            {"session_id": session_id},
+            {"is_escalated": 1},  # project only needed field
+        )
+        return bool(doc and doc.get("is_escalated"))
     except Exception as e:
         logger.error(f"Failed to check escalation status for session {session_id}: {e}")
         return False
@@ -442,10 +461,25 @@ async def save_message(message_data: dict) -> bool:
 
     try:
         result = await db.messages.insert_one(doc)
-        await db.sessions.update_one(
-            {"session_id": message_data.get("session_id")},
-            {"$set": {"updated_at": datetime.now(timezone.utc)}},
-        )
+        # MEDIUM-1: Session updated_at stamp runs as a background task so it
+        # never adds latency to the message insert on the critical path.
+        async def _stamp_session():
+            try:
+                await db.sessions.update_one(
+                    {"session_id": message_data.get("session_id")},
+                    {"$set": {"updated_at": datetime.now(timezone.utc)}},
+                )
+            except Exception:
+                pass
+        asyncio.create_task(_stamp_session())
+
+        # H-9: Invalidate the history cache so the next request gets fresh data.
+        redis = get_redis()
+        if redis:
+            try:
+                await redis.delete(f"history:{message_data.get('session_id')}")
+            except Exception:
+                pass
     except Exception as e:
         logger.error(f"Failed to save message: {e}")
         return False
@@ -471,9 +505,21 @@ async def save_message(message_data: dict) -> bool:
 async def get_formatted_history(session_id: str, limit: int = 100) -> List[Dict[str, str]]:
     """
     Loads conversation history from MongoDB.
-    Returns list of {role, content} dicts sorted chronologically.
-    Limit set to 100 to give GPT-4o full conversation context.
+    H-9: Caches results in Redis (30s TTL) keyed by session_id.
+    Cache is invalidated by save_message() on every new message, so the LLM
+    always sees up-to-date context while avoiding repeated DB reads.
     """
+    # --- Cache read ---
+    redis = get_redis()
+    cache_key = f"history:{session_id}"
+    if redis:
+        try:
+            cached = await redis.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass  # Cache unavailable — fall through to DB
+
     db = get_database()
     if db is None:
         logger.warning(f"DB not connected, returning empty history for session {session_id}")
@@ -484,11 +530,20 @@ async def get_formatted_history(session_id: str, limit: int = 100) -> List[Dict[
         docs = await cursor.to_list(length=limit)
         docs.reverse()  # chronological order for LLM
 
-        return [
+        result = [
             {"role": doc.get("role", "user"), "content": doc.get("content", "")}
             for doc in docs
             if doc.get("content")
         ]
+
+        # --- Cache write (30s TTL — invalidated on new message by save_message) ---
+        if redis and result:
+            try:
+                await redis.setex(cache_key, 30, json.dumps(result))
+            except Exception:
+                pass
+
+        return result
     except Exception as e:
         logger.error(f"Failed to fetch history for session {session_id}: {e}")
         return []
@@ -496,8 +551,8 @@ async def get_formatted_history(session_id: str, limit: int = 100) -> List[Dict[
 
 async def get_session_messages(session_id: str) -> List[Dict]:
     """
-    Retrieves ALL messages for a given session_id.
-    Returns them sorted chronologically (oldest to newest) to rebuild the UI.
+    Retrieves messages for a given session_id.
+    H-2: Capped at 500 to prevent memory spikes from unbounded to_list().
     """
     db = get_database()
     if db is None:
@@ -505,8 +560,11 @@ async def get_session_messages(session_id: str) -> List[Dict]:
         return []
 
     try:
-        cursor = db.messages.find({"session_id": session_id}).sort("timestamp", 1)
-        docs = await cursor.to_list(length=None)
+        cursor = db.messages.find(
+            {"session_id": session_id},
+            sort=[("timestamp", 1)],
+        )
+        docs = await cursor.to_list(length=500)  # H-2: bounded
 
         formatted = []
         for doc in docs:
@@ -534,7 +592,7 @@ def _ensure_utc(ts) -> Optional[datetime]:
     return ts.replace(tzinfo=timezone.utc)
 
 
-async def get_user_messages(user_id: str, limit: int = 300) -> List[Dict]:
+async def get_user_messages(user_id: str, limit: int = 500) -> List[Dict]:
     """
     Retrieves the most recent `limit` messages for a given user_id.
     Capped to prevent unbounded queries that cause gateway timeouts (502).
@@ -546,9 +604,14 @@ async def get_user_messages(user_id: str, limit: int = 300) -> List[Dict]:
         return []
 
     try:
+        from bson import ObjectId
+        # Support both String and ObjectId user_id formats in the database
+        query = {"user_id": user_id}
+        if ObjectId.is_valid(user_id):
+            query = {"$or": [{"user_id": user_id}, {"user_id": ObjectId(user_id)}]}
+
         # Fetch newest `limit` messages first (descending), then reverse for chronological order.
-        # This avoids a full collection scan on large message sets.
-        cursor = db.messages.find({"user_id": user_id}).sort("timestamp", -1).limit(limit)
+        cursor = db.messages.find(query).sort("timestamp", -1).limit(limit)
         docs = await cursor.to_list(length=limit)
         docs.reverse()
 
@@ -573,8 +636,8 @@ async def get_user_messages(user_id: str, limit: int = 300) -> List[Dict]:
 
 async def get_all_sessions(user_id: str) -> List[Dict]:
     """
-    Retrieves ALL sessions for a given user_id.
-    Returns them sorted by creation time (newest first).
+    Retrieves sessions for a given user_id, newest first.
+    H-2: Capped at 100 to prevent unbounded memory usage.
     """
     db = get_database()
     if db is None:
@@ -583,7 +646,7 @@ async def get_all_sessions(user_id: str) -> List[Dict]:
 
     try:
         cursor = db.sessions.find({"user_id": user_id}).sort("created_at", -1)
-        docs = await cursor.to_list(length=None)
+        docs = await cursor.to_list(length=100)  # H-2: bounded
 
         sessions = []
         for doc in docs:
@@ -659,7 +722,7 @@ async def get_escalated_sessions() -> List[Dict]:
         ]
         
         cursor = db.sessions.aggregate(pipeline)
-        docs = await cursor.to_list(length=None)
+        docs = await cursor.to_list(length=200)  # H-2: bounded at 200 escalated sessions
 
         sessions = []
         for doc in docs:
@@ -696,7 +759,7 @@ async def get_expired_escalated_sessions(timeout_minutes: int) -> List[Dict[str,
             "is_escalated": True,
             "updated_at": {"$lte": expiration_time}
         })
-        docs = await cursor.to_list(length=None)
+        docs = await cursor.to_list(length=100)  # H-2: bounded
         return [{"session_id": doc["session_id"], "user_id": doc.get("user_id", doc["session_id"])} for doc in docs]
     except Exception as e:
         logger.error(f"Failed to fetch expired escalated sessions: {e}")

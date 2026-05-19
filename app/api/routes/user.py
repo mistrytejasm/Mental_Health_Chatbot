@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pydantic import ValidationError
 from app.core.auth.oauth2 import get_current_user
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from passlib.context import CryptContext
+
 
 token_auth_scheme = HTTPBearer()
 
@@ -51,7 +51,7 @@ from app.core.logger import get_logger
 from app.core.config import get_settings
 from app.core.auth.hashing import Hash
 from app.core.auth.password_policy import validate_password
-from app.core.auth.JWTtoken import (
+from app.core.auth.jwt_handler import (
     create_access_token,
     create_refresh_token,
     verify_refresh_token,
@@ -61,7 +61,7 @@ from app.services.email_service import generate_otp, validate_email, send_otp_em
 from app.services.db_service import get_existing_session, upsert_session
 from app.services import llm as llm_svc
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -160,7 +160,7 @@ async def _generate_login_greeting(first_name: str, personality_summary: str) ->
     }
     prompt = (
         f"Write a single short sentence (max 15 words) welcoming {first_name} back "
-        "to MindBridge. Use their name. Sound warm and genuine, not generic. "
+        "to MindBuddy. Use their name. Sound warm and genuine, not generic. "
         "No sign-off, no questions, no emojis. Plain text only."
     )
     try:
@@ -171,7 +171,7 @@ async def _generate_login_greeting(first_name: str, personality_summary: str) ->
         resp = await client.chat.completions.create(
             model=_settings.MAIN_MODEL,
             messages=[
-                {"role": "system", "content": f"You are MindBridge, a warm mental health companion. Personality context for {first_name}: {personality_summary}"},
+                {"role": "system", "content": f"You are MindBuddy, a warm mental health companion. Personality context for {first_name}: {personality_summary}"},
                 {"role": "user", "content": prompt},
             ],
             max_tokens=40,
@@ -387,7 +387,7 @@ async def user_login(payload: UserLoginRequest):
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
         stored_hash = user_doc.get("password_hash")
-        if not stored_hash or not await run_in_threadpool(pwd_context.verify, payload.password, stored_hash):
+        if not stored_hash or not await run_in_threadpool(Hash.checkpw, payload.password, stored_hash):
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
         if not user_doc.get("is_active", True):

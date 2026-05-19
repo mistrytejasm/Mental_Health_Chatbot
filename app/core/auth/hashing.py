@@ -1,25 +1,34 @@
+"""
+Password Hashing
+────────────────
+Native bcrypt wrapper. No passlib dependency required.
+
+Public API (backward-compatible):
+    Hash.bcrypt(password)               → hashed string
+    Hash.verify(hashed, plain)          → bool
+    Hash.checkpw(plain, hashed)         → bool  (alias for verify)
+"""
+
 import bcrypt
-# Fix passlib incompatibility with bcrypt 4.0+
-if not hasattr(bcrypt, "__about__"):
-    class BcryptAbout:
-        __version__ = getattr(bcrypt, "__version__", "4.0.0")
-    bcrypt.__about__ = BcryptAbout()
-
-from passlib.context import CryptContext
-
-pwd_cxt = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 class Hash:
-    @staticmethod
-    def bcrypt(password: str):
-        return pwd_cxt.hash(password)
+    """Provides static methods for password hashing and verification using bcrypt."""
 
     @staticmethod
-    def verify(hashed_password, plain_password):
-        return pwd_cxt.verify(plain_password, hashed_password)
-    
+    def bcrypt(password: str) -> str:
+        """Hashes a plaintext password and returns the bcrypt hash as a string."""
+        return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
     @staticmethod
-    def checkpw(plain_password: str, hashed_password: str):
-        """Compatibility method for existing code that expects checkpw"""
-        return pwd_cxt.verify(plain_password, hashed_password)
+    def verify(hashed_password: str, plain_password: str) -> bool:
+        """Returns True if plain_password matches the stored bcrypt hash."""
+        return bcrypt.checkpw(
+            plain_password.encode("utf-8"),
+            hashed_password.encode("utf-8"),
+        )
+
+    @staticmethod
+    def checkpw(plain_password: str, hashed_password: str) -> bool:
+        """Alias for verify() — argument order matches the original passlib API."""
+        return Hash.verify(hashed_password, plain_password)

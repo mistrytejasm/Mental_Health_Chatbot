@@ -42,82 +42,10 @@ from app.services.routing_service import get_available_counselor_count
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
-# Phrases that signal the user wants to keep talking to the AI, not a human.
-# Checked against the lowercased message BEFORE the counselor-redirect branch
-# so a mis-fire from the small Llama model cannot trigger an unwanted handoff.
-# Phrases that unambiguously signal the desire to LIVE, not to self-harm.
-# If the small Llama model mis-fires is_crisis=True on a negated death reference
-# (e.g. "I don't want to die"), this guard forces it back to False before
-# the crisis fork is reached.  Only add phrases that are unambiguous — if a
-# phrase could appear inside a genuine crisis message leave it out.
-_ANTI_CRISIS_PHRASES = (
-    # Explicit desire to live / negated death reference
-    "i don't want to die",      "i dont want to die",
-    "i want to live",           "i want to keep living",
-    # Explicit denial of suicidal intent
-    "i'm not suicidal",         "im not suicidal",          "not suicidal",
-    "i'm not thinking about",   "not thinking about hurting",
-    "i don't want to hurt myself", "i dont want to hurt myself",
-    "i won't hurt myself",      "i wont hurt myself",
-    # Fear of death (not suicidal ideation)
-    "i'm scared of dying",      "im scared of dying",
-    "afraid of dying",          "fear of dying",
-    "fear of death",            "scared of death",
-    "afraid of death",
-    # Common vague-distress idioms — distress but NOT self-harm intent
-    "i feel like dying",        "i feel dead inside",
-    "this is killing me",       "killing me",
-    "i want to disappear",      "want to disappear",
-    "i want to escape",         "i want to run away",
-    "i want to end this pain",  "end this suffering",
-    "i can't take this anymore","cant take this anymore",
-    "exhausted of living like",
-)
-
-# Phrases that signal the user wants to keep talking to the AI, not a human.
-# Checked against the lowercased message BEFORE the counselor-redirect branch
-# so a mis-fire from the small Llama model cannot trigger an unwanted handoff.
-_AI_PREFERENCE_PHRASES = (
-    "talk to you only", "talk to you alone", "only want to talk to you",
-    "just want to talk to you", "i want to talk to you", "talk with you only",
-    "don't want a human", "dont want a human", "not a human", "no human",
-    "don't need a counselor", "dont need a counselor", "don't want a counselor",
-    "dont want a counselor", "don't need a therapist", "dont need a therapist",
-    "just listen", "just be there", "just talk to me", "talk for a bit",
-    "check in on me", "be there with me", "be there for me",
-    "i just need someone to listen", "need someone to listen",
-    "don't need you to fix", "dont need you to fix",
-)
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _build_recent_history_string(history: list[dict], n_turns: int = 4) -> str:
-    if not history:
-        return ""
-    recent = history[-(n_turns * 2):]
-    lines = []
-    for msg in recent:
-        role = "User" if msg.get("role") == "user" else "MindBridge"
-        content = msg.get("content", "").strip()
-        if content:
-            lines.append(f"{role}: {content}")
-    return "\n".join(lines)
-
-
-def _safe_fallback_consensus() -> dict:
-    return {
-        "llm_sentiment":    "neutral",
-        "category":         "general",
-        "intensity":        "moderate",
-        "is_crisis":        False,
-        "wants_counselor":  False,
-        "crisis_type":      None,
-        "reasoning":        "fallback",
-        "recommended_tone": "validating",
-        "message_class":    "emotional_ongoing",
-        "token_budget":     320,
-    }
+from app.services.session_service import session_service
 
 
 # ── Counselor Status API ────────────────────────────────────────────────────────
@@ -148,59 +76,8 @@ async def manual_escalate(
     """
     user_id = str(current_user.get("user_id") or current_user.get("_id"))
     
-    # 1. Fetch the user's active session instead of requiring it from the body
-    session_data = await get_existing_session(user_id)
-    if not session_data:
-        return {"status": "failed", "message": "No active chat session found to escalate."}
-        
-    actual_session_id = session_data["session_id"]
-
-    # 2. Check if any counselors are actually online before escalating
-    from app.services.routing_service import get_available_counselor_count
-    count = await get_available_counselor_count()
-    if count == 0:
-        hotline_text = "No counselor is available at the moment. Please call the helpline at 911."
-        db = get_database()
-        if db is not None:
-            await db.messages.insert_one({
-                "session_id": actual_session_id,
-                "user_id": user_id,
-                "role": "system",
-                "sender_type": "system",
-                "content": hotline_text,
-                "timestamp": datetime.now(timezone.utc),
-            })
-        return {"status": "failed", "message": hotline_text}
-
-    # 3. Mark the session as escalated (is_escalated = True)
-    success = await escalate_session(actual_session_id)
-    if not success:
-        return {"status": "failed", "message": "Failed to escalate session"}
-
-    # 4. Create a pseudo-consensus to feed into the routing engine
-    consensus = {
-        "is_crisis": True,
-        "category": "manual_escalation",
-        "intensity": "high",
-        "reasoning": "User requested manual escalation via app button",
-    }
-
-    # 5. Trigger the smart routing engine in the background.
-    # The routing service exclusively owns all dashboard notifications:
-    # it sends a targeted push to the user's previous counselor (if online)
-    # or a broadcast to all counselors (if no preferred counselor / offline).
-    # Do NOT fire a pre-emptive broadcast here — it would notify every counselor
-    # before routing has determined who should actually receive the session.
-    from app.services.routing_service import route_crisis_session
-    asyncio.create_task(
-        route_crisis_session(
-            user_id=user_id,
-            session_id=actual_session_id,
-            consensus=consensus,
-        )
-    )
-
-    return {"status": "success"}
+    result = await session_service.process_manual_escalation(user_id)
+    return result
 
 
 # ── SSE Stream ─────────────────────────────────────────────────────────────────
@@ -253,6 +130,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
             "type": "escalation_active",
             "handoff_message": "You are currently connected to a human counselor. Please continue in the live chat.",
             "websocket_url": ws_url,
+            "is_crisis": False,
         }
 
         async def _redirect_stream():
@@ -267,11 +145,15 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
     # 2. Load full conversation history
     history = await get_formatted_history(actual_session_id, limit=100)
     turn_count = len(history) // 2
-    recent_history_str = _build_recent_history_string(history, n_turns=4)
+    recent_history_str = session_service.build_recent_history_string(history, n_turns=4)
 
     logger.info("\n" + "═" * 70)
-    logger.info(f"[STREAM] User: {user_id} | Session: {actual_session_id} | Turn: {turn_count}")
-    logger.info(f"[USER]:  {req.message}")
+    logger.info(
+        f"[STREAM] User: {user_id} | Session: {actual_session_id} | Turn: {turn_count}"
+        f" | MsgLen: {len(req.message)}"
+    )
+    # LOW-2: Message content is PII — only logged at DEBUG to protect user privacy.
+    logger.debug(f"[USER MESSAGE]: {req.message}")
     logger.info("═" * 70)
 
     # 3. Generate embedding and retrieve long-term memory (RAG)
@@ -316,26 +198,19 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
             text=req.message,
             roberta_emotion=emotion_result.dominant if emotion_result else "neutral",
             roberta_score=sadness_now,
+            history=recent_history_str or None,
         )
         logger.info(
             f"[STEP 2 OK] crisis: {consensus.get('is_crisis')} | "
+            f"wants_counselor: {consensus.get('wants_counselor')} | "
             f"category: {consensus.get('category')}"
         )
     except Exception as e:
         logger.error(f"[STEP 2 ERROR] {e}")
-        consensus = _safe_fallback_consensus()
+        consensus = session_service.safe_fallback_consensus()
 
-    _msg_lower = req.message.lower()
-
-    # ── Anti-crisis guard — suppress false-positive crisis on negated/fear phrases ──
-    if consensus.get("is_crisis") is True and any(p in _msg_lower for p in _ANTI_CRISIS_PHRASES):
-        logger.info(f"[CRISIS_GUARD] Suppressed false-positive crisis — anti-crisis phrase detected: '{req.message[:80]}'")
-        consensus["is_crisis"] = False
-
-    # ── Counselor request detection — user explicitly asked for a human ───────
-    if consensus.get("wants_counselor") is True and any(p in _msg_lower for p in _AI_PREFERENCE_PHRASES):
-        logger.info(f"[COUNSELOR_REQUEST] Suppressed — user message indicates AI preference: '{req.message[:80]}'")
-        consensus["wants_counselor"] = False
+    # ── Nuance handling now managed by context-aware LLM in synthesize_consensus ──
+    is_message_crisis = bool(consensus.get("is_crisis", False))
 
     if consensus.get("wants_counselor") is True and not consensus.get("is_crisis"):
         logger.info(f"[COUNSELOR_REQUEST] User {user_id} requested a human counselor.")
@@ -347,6 +222,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
             "type": "counselor_request",
             "message": "Of course — you can connect with a human counselor anytime using the button in the top right corner 👤.",
             "button_icon_url": f"{_base_url}/static/images/connect_counselor_btn.png",
+            "is_crisis": is_message_crisis,
         }
 
         async def _counselor_request_stream():
@@ -362,19 +238,10 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
     if consensus.get("is_crisis") is True:
         logger.warning(f"[ESCALATION] Crisis detected for user {user_id} in session {actual_session_id}.")
 
-        escalated_ok = await escalate_session(actual_session_id)
-        if not escalated_ok:
-            logger.error(
-                f"[ESCALATION] escalate_session() failed for session {actual_session_id} — "
-                "routing aborted; falling back to normal AI response."
-            )
-            # Clear the crisis flag so execution continues to the normal AI stream below
-            consensus["is_crisis"] = False
-
-    if consensus.get("is_crisis") is True:
         # Before routing, check if anyone is available to avoid sending false hope
         from app.services.routing_service import get_available_counselor_count
         count = await get_available_counselor_count()
+        
         if count == 0:
             hotline_text = "No counselor is available at the moment. Please call the helpline at 911."
             await save_message({
@@ -388,6 +255,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
                 "done": True,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "text": hotline_text,
+                "is_crisis": True,
             }
             async def _hotline_stream():
                 yield f"data: {json.dumps(hotline_payload)}\n\n"
@@ -397,24 +265,84 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
-        # Routing service exclusively owns all dashboard notifications — do NOT
-        from app.services.routing_service import route_crisis_session
-        asyncio.create_task(
-            route_crisis_session(
-                user_id=user_id,
-                session_id=actual_session_id,
-                consensus=consensus,
-            )
+        # Acquire atomic pre-routing lock to block duplicate concurrent requests
+        lock_result = await db.sessions.find_one_and_update(
+            {
+                "session_id": actual_session_id,
+                "is_escalated": {"$ne": True},
+                "assigned_counselor_id": {"$ne": "__routing__"},
+            },
+            {"$set": {
+                "is_escalated": True,
+                "assigned_counselor_id": "__routing__",
+                "routing_started_at": datetime.now(timezone.utc),
+            }},
         )
 
-        # Return a single done-event — no AI chunks, no dual response
+        if lock_result is None:
+            # Already escalated or routing — return the crisis screen payload
+            _settings = get_settings()
+            _ws_url = f"ws://{_settings.SERVER_PUBLIC_HOST}:{_settings.SERVER_PORT}/api/human/chat/{actual_session_id}"
+            crisis_payload = {
+                "done": True,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "crisis_escalation",
+                "handoff_message": "Connecting you to our specialized support team. Please stay on this screen.",
+                "websocket_url": _ws_url,
+                "emotion": {
+                    "dominant_emotion": emotion_result.dominant if emotion_result else "neutral",
+                    "response_mode": consensus.get("category", "general"),
+                    "intensity": consensus.get("intensity", "high"),
+                    "is_crisis_signal": True,
+                },
+                "is_crisis": True,
+            }
+            async def _crisis_stream():
+                yield f"data: {json.dumps(crisis_payload)}\n\n"
+            return StreamingResponse(
+                _crisis_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        # AWAIT routing synchronously in HTTP thread to prevent race conditions
+        from app.services.routing_service import route_crisis_session
+        await route_crisis_session(
+            user_id=user_id,
+            session_id=actual_session_id,
+            consensus=consensus,
+            pre_acquired_lock=True,
+        )
+
+        # Fetch updated session doc to verify the real routing outcome
+        updated_session = await db.sessions.find_one({"session_id": actual_session_id})
+        assigned_cid = updated_session.get("assigned_counselor_id") if updated_session else None
+
+        if not assigned_cid or assigned_cid == "__routing__":
+            # Routing failed or rolled back
+            hotline_text = "No counselor is available at the moment. Please call the helpline at 911."
+            hotline_payload = {
+                "done": True,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "text": hotline_text,
+                "is_crisis": True,
+            }
+            async def _hotline_stream():
+                yield f"data: {json.dumps(hotline_payload)}\n\n"
+            return StreamingResponse(
+                _hotline_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        # Successfully assigned to counselor! Return real assignment payload
         _settings = get_settings()
         _ws_url = f"ws://{_settings.SERVER_PUBLIC_HOST}:{_settings.SERVER_PORT}/api/human/chat/{actual_session_id}"
         crisis_payload = {
             "done": True,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "type": "crisis_escalation",
-            "handoff_message": "A counselor is joining shortly... you're not alone.",
+            "handoff_message": "Connecting you to our specialized support team. Please stay on this screen.",
             "websocket_url": _ws_url,
             "emotion": {
                 "dominant_emotion": emotion_result.dominant if emotion_result else "neutral",
@@ -422,6 +350,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
                 "intensity": consensus.get("intensity", "high"),
                 "is_crisis_signal": True,
             },
+            "is_crisis": True,
         }
 
         async def _crisis_stream():
@@ -445,7 +374,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
                 long_term_memory=long_term_memory,
             ):
                 full_reply.append(chunk)
-                yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+                yield f"data: {json.dumps({'chunk': chunk, 'is_crisis': is_message_crisis})}\n\n"
 
             emotion_dict = {
                 "dominant_emotion":  emotion_result.dominant if emotion_result else "neutral",
@@ -457,6 +386,7 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
                 "done": True,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "emotion": emotion_dict,
+                "is_crisis": is_message_crisis,
             }
             yield f"data: {json.dumps(done_payload)}\n\n"
 

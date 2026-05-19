@@ -1,45 +1,61 @@
-import asyncio
-import bcrypt
+"""
+MindBuddy — FastAPI Application Entry Point
+──────────────────────────────────────────────
+Initialises the application, registers middleware, mounts routers,
+and manages the lifespan (startup/shutdown) of shared resources.
+"""
 
-# Fix passlib incompatibility with bcrypt 4.0+
-if not hasattr(bcrypt, "__about__"):
-    class BcryptAbout:
-        __version__ = getattr(bcrypt, "__version__", "4.0.0")
-    bcrypt.__about__ = BcryptAbout()
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
-from app.services.emotion import warmup
-from app.core.database import connect_to_mongo, close_mongo_connection, get_database
+from app.api.routes import assessment, audio, chat, user
+from app.api.routes.human import router as human_router
 from app.core.config import get_settings
+from app.core.database import close_mongo_connection, connect_to_mongo, get_database
+from app.core.redis import redis_manager
 from app.core.logger import get_logger
-from app.api.routes import chat, audio, assessment, human, user
+from app.services.emotion import warmup
+import os
 
 logger = get_logger("main")
 settings = get_settings()
+origins = os.getenv("ALLOWED_ORIGINS", "").split(",")
 
 
-# ── Lifespan: pre-warm the emotion model on startup ──────────────────────────
+
+# ── Application Lifespan ──────────────────────────────────────────────────────
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("MindBridge starting up...")
-    
-    # 1. Connect to MongoDB
+    """
+    Manages startup and shutdown of shared application resources.
+
+    Startup sequence:
+      1. Connect to MongoDB and verify indexes.
+      2. Pre-warm the HuggingFace emotion model (CPU — run in thread pool).
+      3. Reset all counselor online flags (in-memory registry is lost on restart).
+      4. Start the global 35-minute session inactivity watchdog.
+    """
+    logger.info("MindBuddy starting up...")
+
+    # 1. Database & Cache
     await connect_to_mongo()
-    
-    # 2. Warm up the HuggingFace emotion model in a background thread
+    await redis_manager.connect()
+
+    # 2. Emotion model warm-up (CPU-bound — offloaded to thread pool)
     loop = asyncio.get_event_loop()
     try:
         await loop.run_in_executor(None, warmup)
-    except Exception as e:
-        logger.warning(f"Model warmup skipped: {e}")
-        
-    # 3. Reset all counselor online flags — in-memory registry is gone after restart
+    except Exception as exc:
+        logger.warning(f"Emotion model warmup skipped: {exc}")
+
+    # 3. Reset counselor presence flags that were lost when the process restarted
     try:
         db = get_database()
         if db is not None:
@@ -48,61 +64,67 @@ async def lifespan(app: FastAPI):
                 {"$set": {"is_online": False, "current_active_sessions": 0}},
             )
             logger.info(f"Startup: reset {result.modified_count} counselor(s) to offline.")
-    except Exception as e:
-        logger.warning(f"Startup: could not reset counselor online flags: {e}")
+    except Exception as exc:
+        logger.warning(f"Startup: could not reset counselor online flags: {exc}")
 
-    # 4. Start Global 35-minute Inactivity Watchdog
+    # 4. Global inactivity watchdog
+    from app.api.routes.human.background_tasks import inactivity_watchdog
     try:
-        loop.create_task(human.inactivity_watchdog())
-    except Exception as e:
-        logger.error(f"Failed to start watchdog: {e}")
+        loop.create_task(inactivity_watchdog())
+    except Exception as exc:
+        logger.error(f"Failed to start inactivity watchdog: {exc}")
 
-    logger.info("MindBridge ready.")
+    logger.info("MindBuddy ready.")
     yield
-    logger.info("MindBridge shutting down.")
+
+    logger.info("MindBuddy shutting down.")
+    await redis_manager.disconnect()
     await close_mongo_connection()
 
 
-# ── App ───────────────────────────────────────────────────────────────────────
+# ── Application Factory ───────────────────────────────────────────────────────
+
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     lifespan=lifespan,
 )
 
-_allowed_origins = (
-    [o.strip() for o in settings.ALLOWED_ORIGINS.split(",") if o.strip()]
-    if settings.ALLOWED_ORIGINS
-    else ["*"]
-)
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https?://.*",  # Permissive for development/local WiFi
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# app.add_middleware(
+#     CORSMiddleware,
+#     allow_origin_regex=r"https?://.*",  # Permissive for local network development
+#     allow_credentials=True,
+#     allow_methods=["*"],
+#     allow_headers=["*"],
+# )
+
+
+# ── Exception Handlers ────────────────────────────────────────────────────────
+
 @app.exception_handler(RequestValidationError)
-async def custom_validation_exception_handler(request, exc):
+async def validation_exception_handler(request, exc: RequestValidationError):
     """
-    Intercepts Pydantic's default 422 Unprocessable Entity and returns
-    a mobile-friendly 400 Bad Request with structured error details.
+    Converts Pydantic's 422 Unprocessable Entity into a mobile-friendly 400 Bad Request.
 
     Field path cleaning:
-    - Strips the leading 'body' segment Pydantic injects for request bodies.
-    - Uses only the terminal (most specific) field name so mobile clients
-      receive plain names like 'email' instead of 'body -> common_fields -> email'.
+      - Strips the leading 'body' segment Pydantic injects for request bodies.
+      - Returns only the terminal (most specific) field name so mobile clients
+        receive 'email' rather than 'body -> common_fields -> email'.
+      - Returns only the first error to guide the user one field at a time.
     """
     all_errors = exc.errors()
-    # Return only the first error so the mobile app can guide the user
-    # one field at a time (email → phone → gender → …) rather than
-    # overwhelming them with every problem at once.
-    first = all_errors[0] if all_errors else {}
-    loc = first.get("loc", [])
-    loc_parts = [str(p) for p in loc if str(p) != "body"]
-    field = loc_parts[-1] if loc_parts else "unknown"
-    error_message = first.get("msg", "Invalid value")
+    first_error = all_errors[0] if all_errors else {}
+    location_parts = [str(p) for p in first_error.get("loc", []) if str(p) != "body"]
+    field_name = location_parts[-1] if location_parts else "unknown"
+    error_message = first_error.get("msg", "Invalid value")
 
     return JSONResponse(
         status_code=400,
@@ -111,30 +133,36 @@ async def custom_validation_exception_handler(request, exc):
             "message": error_message,
             "details": [
                 {
-                    "field": field,
+                    "field": field_name,
                     "message": error_message,
-                    "type": first.get("type", "value_error"),
+                    "type": first_error.get("type", "value_error"),
                 }
             ],
         },
     )
 
-# ── API Routers ───────────────────────────────────────────────────────────────
+
+# ── Routers ───────────────────────────────────────────────────────────────────
+
 app.include_router(chat.router)
 app.include_router(audio.router)
 app.include_router(assessment.router)
-app.include_router(human.router)
+app.include_router(human_router)
 app.include_router(user.router)
 
-# ── Static files (UI) ─────────────────────────────────────────────────────────
+
+# ── Static Files & Root ───────────────────────────────────────────────────────
+
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
 
 @app.get("/", include_in_schema=False)
 async def serve_ui():
-    logger.info("Serving UI index.html")
+    """Serves the counselor dashboard single-page application."""
     return FileResponse("app/static/index.html")
 
-@app.get("/health")
-async def health():
-    logger.info("Health check endpoint hit")
-    return {"status": "ok", "app": settings.APP_NAME}
+
+@app.get("/health", tags=["health"])
+async def health_check():
+    """Returns application health status. Used by load balancers and uptime monitors."""
+    return {"status": "ok", "app": settings.APP_NAME, "version": settings.APP_VERSION}
