@@ -43,9 +43,7 @@ _CRISIS_KEYWORDS: tuple[str, ...] = (
     "i am going to die",    "i'm going to die",
     "end my life",          "end it all",
     "take my life",         "taking my life",
-    "hurt myself",          "hurting myself",       "harm myself",
-    "cut myself",           "cutting myself",
-    "suicide",              "suicidal",
+    "cutting myself",
     "want to kill myself",  "going to kill myself",  "going to end my life",
     "plan to end my life",  "thinking of ending my life",
     "no reason to live",    "not worth living",
@@ -125,7 +123,8 @@ async def synthesize_consensus(text: str, roberta_emotion: str, roberta_score: f
         "3. IDIOM DETECTION: Distinguish between metaphors ('this is killing me', 'I feel dead inside') and literal intent.\n"
         "4. FEAR vs INTENT: 'I'm scared of dying' is NOT a crisis. 'I want to die' IS a crisis.\n"
         "5. INTENT/PLAN: Any expression of current intent, plan, or desire to end one's life or self-harm must be is_crisis=true.\n"
-        "6. GREETINGS: Do NOT set is_crisis=true for isolated greetings (e.g., 'hi', 'hello', 'hey', 'good morning') even if the history contains a past crisis. Only escalate if the current message continues the crisis or expresses new distress.\n\n"
+        "6. GREETINGS: Do NOT set is_crisis=true for isolated greetings (e.g., 'hi', 'hello', 'hey', 'good morning') even if the history contains a past crisis. Only escalate if the current message continues the crisis or expresses new distress.\n"
+        "7. INFORMATIONAL/ADVICE/COPING REQUESTS: Do NOT set is_crisis=true if the user is asking for general information, definitions, advice, coping strategies, or guidance regarding thoughts of self-harm or suicide (e.g., 'how can I manage suicidal thoughts', 'is it possible to get advice on self-harm thoughts'). Only escalate if they express a personal, active plan, intent, or imminent danger to harm themselves right now.\n\n"
 
         "CRITICAL RULES FOR WANTS_COUNSELOR:\n"
         "1. CURRENT MESSAGE ONLY: Evaluate ONLY the 'Current User Text' to determine if they want a counselor. Do NOT set wants_counselor=true if they only asked in the Conversation History but not in the current message.\n"

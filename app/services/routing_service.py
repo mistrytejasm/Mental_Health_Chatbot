@@ -75,12 +75,9 @@ async def _is_available(counselor_doc: dict) -> bool:
         return False
 
     # Gate 5: real-time WebSocket presence via Redis
-    # We check Redis for a live WebSocket, but if they aren't in Redis
-    # we STILL trust the DB flags if they are fresh. This ensures REST-polling
-    # counselors (fallback mode) are still counted as available.
     redis = get_redis()
+    counselor_id = str(counselor_doc.get("_id", ""))
     if redis:
-        counselor_id = str(counselor_doc.get("_id", ""))
         try:
             is_ws_online = await redis.sismember("dashboard:online_counselors", counselor_id)
             if is_ws_online:
@@ -90,11 +87,21 @@ async def _is_available(counselor_doc: dict) -> bool:
             from app.core.connection_registry import is_counselor_connected
             if is_counselor_connected(counselor_id):
                 return True
+            
+            # If we successfully queried Redis and memory and both said False, they are offline!
+            return False
         except Exception:
+            # If Redis crashed during the query, fallback to local registry check
             pass
 
-    # Fallback: trust DB flags (already verified in db_pass above)
-    return True
+    # Fallback if Redis is unavailable or crashed:
+    # Check if they are connected to this instance's memory registry.
+    # This prevents blindly trusting stale DB heartbeat flags for offline counselors.
+    from app.core.connection_registry import is_counselor_connected
+    if is_counselor_connected(counselor_id):
+        return True
+        
+    return False
 
 
 
@@ -206,10 +213,10 @@ async def get_available_counselor_count() -> int:
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-async def route_crisis_session(user_id: str, session_id: str, consensus: dict) -> None:
+async def route_crisis_session(user_id: str, session_id: str, consensus: dict, pre_acquired_lock: bool = False) -> None:
     """
-    Main routing orchestrator. Always called via asyncio.create_task() so it
-    never blocks the SSE stream.
+    Main routing orchestrator. Can be run synchronously to prevent race conditions
+    in HTTP handlers, or asynchronously in background tasks.
 
     Uses the doctor_user_assignments collection for Tier 1 sticky routing and
     persists new assignments via MongoDB transactions to prevent data
@@ -240,19 +247,20 @@ async def route_crisis_session(user_id: str, session_id: str, consensus: dict) -
             {"$set": {"assigned_counselor_id": None, "routing_started_at": None}},
         )
 
-        # Acquire routing lock. Query excludes "__routing__" to prevent duplicate
-        # concurrent routing tasks, but allows any other value (null or a stale
-        # counselor ID from a prior closed session) so re-escalations are not blocked.
-        claim_result = await db.sessions.find_one_and_update(
-            {"session_id": session_id, "assigned_counselor_id": {"$ne": "__routing__"}},
-            {"$set": {
-                "assigned_counselor_id": "__routing__",
-                "routing_started_at": datetime.now(timezone.utc),
-            }},
-        )
-        if claim_result is None:
-            logger.info(f"[ROUTING] Session {session_id} already being routed — skipping duplicate task.")
-            return
+        if not pre_acquired_lock:
+            # Acquire routing lock. Query excludes "__routing__" to prevent duplicate
+            # concurrent routing tasks, but allows any other value (null or a stale
+            # counselor ID from a prior closed session) so re-escalations are not blocked.
+            claim_result = await db.sessions.find_one_and_update(
+                {"session_id": session_id, "assigned_counselor_id": {"$ne": "__routing__"}},
+                {"$set": {
+                    "assigned_counselor_id": "__routing__",
+                    "routing_started_at": datetime.now(timezone.utc),
+                }},
+            )
+            if claim_result is None:
+                logger.info(f"[ROUTING] Session {session_id} already being routed — skipping duplicate task.")
+                return
 
         assigned_counselor: Optional[dict] = None
         preferred_id: Optional[str] = None
@@ -636,24 +644,16 @@ async def _notify_counselor(
             "websocket_url": ws_url,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-
-        # --- Step 1: Persist to DB notification queue (P-1: queue prevents overwrite) ---
-        # Using $push instead of $set so multiple assignments while the counselor is
-        # offline are ALL queued and delivered on reconnect — never overwritten.
-        db = get_database()
-        if db is not None:
-            await db.admins.update_one(
-                {"_id": ObjectId(counselor_id)},
-                {"$push": {"pending_notifications": assigned_payload}}
-            )
-            logger.info(f"[ROUTING] [NOTIFY] ✓ Notification queued in DB for {counselor_id}.")
+        # Removed Step 1 (DB pending_notifications queue)
+        # Notifications should only be sent in real-time when the counselor is active.
 
         # --- Step 2: Attempt real-time WebSocket push ---
         await ws_manager.notify_counselor(counselor_id, assigned_payload)
         logger.info(f"[ROUTING] [NOTIFY] Real-time push dispatched for {counselor_id}.")
 
-        # --- Step 3: Global Broadcast (for dashboard monitors/other instances) ---
-        await ws_manager.broadcast_to_dashboard(assigned_payload)
+        # Global Broadcast of targeted assignments causes other counselors
+        # (even those at max capacity) to incorrectly receive the notification.
+        # Removed broadcast_to_dashboard here.
 
     except Exception as e:
         logger.error(f"[ROUTING] [NOTIFY] Guaranteed delivery failed for counselor {counselor_id}: {e}")

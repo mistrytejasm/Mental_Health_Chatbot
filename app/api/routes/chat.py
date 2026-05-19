@@ -238,19 +238,10 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
     if consensus.get("is_crisis") is True:
         logger.warning(f"[ESCALATION] Crisis detected for user {user_id} in session {actual_session_id}.")
 
-        escalated_ok = await escalate_session(actual_session_id)
-        if not escalated_ok:
-            logger.error(
-                f"[ESCALATION] escalate_session() failed for session {actual_session_id} — "
-                "routing aborted; falling back to normal AI response."
-            )
-            # Clear the crisis flag so execution continues to the normal AI stream below
-            consensus["is_crisis"] = False
-
-    if consensus.get("is_crisis") is True:
         # Before routing, check if anyone is available to avoid sending false hope
         from app.services.routing_service import get_available_counselor_count
         count = await get_available_counselor_count()
+        
         if count == 0:
             hotline_text = "No counselor is available at the moment. Please call the helpline at 911."
             await save_message({
@@ -274,17 +265,77 @@ async def stream_message(req: StreamChatRequest, request: Request, current_user 
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
 
-        # Routing service exclusively owns all dashboard notifications — do NOT
-        from app.services.routing_service import route_crisis_session
-        asyncio.create_task(
-            route_crisis_session(
-                user_id=user_id,
-                session_id=actual_session_id,
-                consensus=consensus,
-            )
+        # Acquire atomic pre-routing lock to block duplicate concurrent requests
+        lock_result = await db.sessions.find_one_and_update(
+            {
+                "session_id": actual_session_id,
+                "is_escalated": {"$ne": True},
+                "assigned_counselor_id": {"$ne": "__routing__"},
+            },
+            {"$set": {
+                "is_escalated": True,
+                "assigned_counselor_id": "__routing__",
+                "routing_started_at": datetime.now(timezone.utc),
+            }},
         )
 
-        # Return a single done-event — no AI chunks, no dual response
+        if lock_result is None:
+            # Already escalated or routing — return the crisis screen payload
+            _settings = get_settings()
+            _ws_url = f"ws://{_settings.SERVER_PUBLIC_HOST}:{_settings.SERVER_PORT}/api/human/chat/{actual_session_id}"
+            crisis_payload = {
+                "done": True,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": "crisis_escalation",
+                "handoff_message": "Connecting you to our specialized support team. Please stay on this screen.",
+                "websocket_url": _ws_url,
+                "emotion": {
+                    "dominant_emotion": emotion_result.dominant if emotion_result else "neutral",
+                    "response_mode": consensus.get("category", "general"),
+                    "intensity": consensus.get("intensity", "high"),
+                    "is_crisis_signal": True,
+                },
+                "is_crisis": True,
+            }
+            async def _crisis_stream():
+                yield f"data: {json.dumps(crisis_payload)}\n\n"
+            return StreamingResponse(
+                _crisis_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        # AWAIT routing synchronously in HTTP thread to prevent race conditions
+        from app.services.routing_service import route_crisis_session
+        await route_crisis_session(
+            user_id=user_id,
+            session_id=actual_session_id,
+            consensus=consensus,
+            pre_acquired_lock=True,
+        )
+
+        # Fetch updated session doc to verify the real routing outcome
+        updated_session = await db.sessions.find_one({"session_id": actual_session_id})
+        assigned_cid = updated_session.get("assigned_counselor_id") if updated_session else None
+
+        if not assigned_cid or assigned_cid == "__routing__":
+            # Routing failed or rolled back
+            hotline_text = "No counselor is available at the moment. Please call the helpline at 911."
+            hotline_payload = {
+                "done": True,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "text": hotline_text,
+                "is_crisis": True,
+            }
+            async def _hotline_stream():
+                yield f"data: {json.dumps(hotline_payload)}\n\n"
+            return StreamingResponse(
+                _hotline_stream(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+
+        # Successfully assigned to counselor! Return real assignment payload
         _settings = get_settings()
         _ws_url = f"ws://{_settings.SERVER_PUBLIC_HOST}:{_settings.SERVER_PORT}/api/human/chat/{actual_session_id}"
         crisis_payload = {

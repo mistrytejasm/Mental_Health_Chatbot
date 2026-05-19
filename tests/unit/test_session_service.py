@@ -1,4 +1,5 @@
 import pytest
+from unittest.mock import AsyncMock
 from app.services.session_service import session_service
 
 @pytest.mark.asyncio
@@ -20,11 +21,17 @@ async def test_process_manual_escalation_no_counselor(mocker, mock_db):
 async def test_process_manual_escalation_success(mocker, mock_db):
     mocker.patch("app.services.session_service.get_existing_session", return_value={"session_id": "sess123"})
     mocker.patch("app.services.session_service.get_available_counselor_count", return_value=1)
-    mocker.patch("app.services.session_service.escalate_session", return_value=True)
-    mock_route = mocker.patch("app.services.session_service.route_crisis_session", return_value=None)
+    
+    # Mock find_one_and_update to simulate lock acquisition success
+    mock_db.sessions.find_one_and_update.return_value = {"session_id": "sess123"}
+    # Mock find_one to return final successful assignment
+    mock_db.sessions.find_one.return_value = {"session_id": "sess123", "assigned_counselor_id": "counselor123"}
+    
+    mock_route = mocker.patch("app.services.session_service.route_crisis_session", new_callable=AsyncMock)
     
     result = await session_service.process_manual_escalation("user123")
     assert result == {"status": "success"}
+    mock_route.assert_called_once()
 
 def test_build_recent_history_string():
     history = [

@@ -202,7 +202,7 @@ class UserCreateRequest(BaseModel):
             # Counselor: professional credentials are required for compliance
             required_counselor = [
                 "professional_role", "license_number", "state_of_licensure",
-                "npi_number", "practice_type", "city", "state", "consultation_mode",
+                "npi_number", "city", "state",
             ]
             missing = [f for f in required_counselor if not getattr(self, f)]
             if missing:

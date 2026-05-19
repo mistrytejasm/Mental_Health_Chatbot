@@ -678,23 +678,8 @@ async def human_chat_ws(websocket: WebSocket, session_id: str) -> None:
             still_in_room = await manager.is_role_in_room(session_id, "human_counselor")
 
             if db is not None:
-                if not still_in_room:
-                    # Last connection closed — release the capacity slot claimed at routing time
-                    try:
-                        await db.admins.update_one(
-                            {
-                                "_id": ObjectId(authenticated_user_id),
-                                "current_active_sessions": {"$gt": 0},
-                            },
-                            {"$inc": {"current_active_sessions": -1}},
-                        )
-                    except Exception as exc:
-                        logger.error(
-                            f"[WS CHAT] Failed to decrement active session count"
-                            f" | counselor_id={authenticated_user_id} | error={exc}"
-                        )
-
-                # Start grace period — gives counselor time to reconnect before closing
+                # Start grace period — gives counselor time to reconnect before closing.
+                # Capacity slot will be released IF the grace period expires.
                 asyncio.create_task(
                     _counsel_reconnect_grace(session_id, user_id, authenticated_user_id)
                 )

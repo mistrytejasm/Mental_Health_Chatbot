@@ -29,9 +29,18 @@ def mock_redis(mocker):
     pubsub_mock.unsubscribe = AsyncMock()
     pubsub_mock.punsubscribe = AsyncMock()
     pubsub_mock.close = AsyncMock()
-    pubsub_mock.listen = MagicMock(return_value=asyncio.sleep(100)) # dummy listen
     
+    async def dummy_listen():
+        # Yield a single message or just sleep to represent an empty listener
+        await asyncio.sleep(100)
+        yield {"type": "message", "data": '{"action": "broadcast", "payload": {}}'}
+    
+    pubsub_mock.listen = dummy_listen
     redis_mock.pubsub = MagicMock(return_value=pubsub_mock)
+    
+    # Mock hincrby to return an integer so type checks (like count <= 0) don't fail
+    redis_mock.hincrby = AsyncMock(return_value=1)
+    redis_mock.hget = AsyncMock(return_value=1)
     
     mocker.patch("app.core.redis.get_redis", return_value=redis_mock)
     mocker.patch("app.api.routes.human.connection_manager.get_redis", return_value=redis_mock)
